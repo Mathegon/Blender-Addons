@@ -1,2 +1,55 @@
-# Blender-Addons
-Collection of various Blender addons created by me
+# Highpoly baker - GRILLEN
+This is a Blender add-on named “GRILLEN.” It helps bake texture maps from detailed high-poly meshes onto a low-poly mesh.
+
+It can:
+Bake normal, ambient-occlusion, diffuse/color, roughness, metallic, and alpha maps.
+Use one or many high-poly source objects.
+Create a shrink-wrapped “cage” mesh to control ray casting.
+Auto-estimate ray distances, warn about UV overlaps, optionally apply scale, and save PNG outputs.
+Build and assign a Blender material using the baked maps.
+Process a queue of high/low-poly pairs.
+Improve normal/alpha maps with 2× supersampling; normal vectors are correctly re-normalized after downsampling.
+
+v1.10.0 — new Bake Active Node feature. Here's how it works:
+
+Workflow:
+
+Select your mesh object
+Open the Shader Editor and click the node whose output you want to flatten (e.g. an RGB Curves, Hue/Saturation, Color Ramp, Mix node — anything with a Color or Value output)
+In the Grillen N-panel, click Bake Active Node in the new NODE BAKE section
+
+v1.9.8 — the toggle is renamed to "Only Rebake Changed" with a clearer tooltip, and the underlying logic is fixed
+
+v1.9.7 — reinstall to see the change. Here's what's different:
+
+Each map's extra settings are now inside their own boxed sub-section with a header label and icon:
+
+NORMAL MAP box (with a face-normal icon) appears under the toggles when Normal is enabled, containing just "Supersample (2×)"
+ALPHA MAP box (with an alpha-image icon) appears when Alpha is enabled, containing the Alpha Source dropdown, "Supersample (2×)", and Edge Smoothing
+
+v1.9.6 — Normal map now has its own Supersample (2×) toggle, shown when the Normal map is enabled (off by default, since normal maps are usually less prone to visible aliasing than alpha cutouts, and doubling bake time isn't always worth it).
+
+v1.9.5 — the bug was remarkably subtle.
+
+v1.9.4 — two new controls appear under the Alpha toggle when it's enabled:
+
+Supersample (2×) — on by default. Bakes at twice the target resolution (so 1024×1024 for a 512px result), then box-filter downsamples back to target. Each output texel averages 4 bake rays instead of 1, giving true geometric anti-aliasing at wire and perforation edges. Doubles bake time for the alpha pass only.
+
+Edge Smoothing — default 1.2. After baking (and downsampling if supersample is on), applies a separable Gaussian blur to soften any remaining stairstepping. Pure numpy, takes ~0.06 seconds at 512px. Setting to 0 disables it entirely. Values around 1.0–2.0 work well for most wire/net geometry.
+
+v1.9.3 — here's the complete diagnosis and what changed:
+
+The actual problem — far-wall hits on a closed high-poly
+
+Rays from the +Y and +Z low-poly faces shoot inward. At the texel positions that correspond to holes in the perforated near face, the ray passes straight through to the far wall of the high-poly cube (0.55m away). Blender bakes that far-wall hit as solid white — which is wrong, it should be black (a hole). The ±X faces had their single center ray land directly on a hole, so they missed entirely.
+
+The fix — auto-calculated max_ray_distance for geometry alpha
+
+The addon now automatically limits how far alpha bake rays can travel. Using find_nearest it measures the actual gap between low-poly and high-poly surfaces, then sets:
+  cage_extrusion = the measured gap (to push origins just outside the surface)
+max_ray_distance = gap × 3 (enough to catch the near face from any position, but nowhere near the far wall)
+
+v1.9.2:
+
+use_backface_culling = False — makes both sides of the mesh visible, so you see the inner face of the cube through the holes rather than nothing
+HASHED blend mode instead of CLIP — CLIP gives a hard binary cutoff which looks blocky on fine wires; HASHED uses stochastic dithering which handles thin geometry edges much more gracefully without needing alpha_threshold tuning

@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "GRILLEN v1.9.8",
+    "name": "GRILLEN v1.10.0",
     "author": "Claude",
-    "version": (1, 9, 8),
+    "version": (1, 10, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Grillen",
     "description": (
@@ -1482,6 +1482,157 @@ class BAKER_OT_Bake(Operator):
 # Auto cage offset operator
 # ---------------------------------------------------------------------------
 
+class BAKER_OT_BakeSelectedNode(Operator):
+    bl_idname  = "baker.bake_selected_node"
+    bl_label   = "Bake Selected Node"
+    bl_description = (
+        "Bake the output of the active node in the Shader Editor to a texture. "
+        "Useful for flattening adjustment nodes (Curves, Hue/Sat, etc.) before glTF export."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s   = context.scene.baker_settings
+        obj = context.active_object
+
+        if obj is None or obj.type != 'MESH':
+            self.report({'ERROR'}, "Select a mesh object.")
+            return {'CANCELLED'}
+
+        if not obj.data.uv_layers:
+            self.report({'ERROR'}, f"'{obj.name}' has no UV map.")
+            return {'CANCELLED'}
+
+        if not obj.data.materials or not obj.data.materials[0]:
+            self.report({'ERROR'}, f"'{obj.name}' has no material.")
+            return {'CANCELLED'}
+
+        mat   = obj.data.materials[0]
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        # Get active node
+        source_node = nodes.active
+        if source_node is None:
+            self.report({'ERROR'}, "No active node — select a node in the Shader Editor.")
+            return {'CANCELLED'}
+
+        if source_node.type == 'OUTPUT_MATERIAL':
+            self.report({'ERROR'}, "Cannot bake the Material Output node itself.")
+            return {'CANCELLED'}
+
+        # Find the best output socket — prefer Color/RGBA, then first VALUE
+        source_socket = None
+        for out in source_node.outputs:
+            if out.type == 'RGBA':
+                source_socket = out
+                break
+        if source_socket is None:
+            for out in source_node.outputs:
+                if out.type in ('VALUE', 'VECTOR'):
+                    source_socket = out
+                    break
+        if source_socket is None:
+            source_socket = source_node.outputs[0] if source_node.outputs else None
+
+        if source_socket is None:
+            self.report({'ERROR'}, f"Node '{source_node.name}' has no output sockets.")
+            return {'CANCELLED'}
+
+        view3d_area, view3d_region = _get_view3d_context(context)
+        if view3d_area is None:
+            self.report({'ERROR'}, "No 3D Viewport found.")
+            return {'CANCELLED'}
+
+        # Determine if result is color or data
+        is_data = source_socket.type in ('VALUE', 'VECTOR')
+
+        # Create image name from object + node
+        node_label = source_node.label or source_node.name
+        safe_name  = "".join(c if c.isalnum() or c in " _-" else "_" for c in node_label).strip()
+        img_name   = f"{obj.name}_{safe_name}"
+
+        res = _res(s)
+        img = _make_image(img_name, res, is_data=is_data, overwrite=s.overwrite_images)
+
+        # --- Temporarily rewire: source_socket → Emission → Material Output ---
+        output_node = next(
+            (n for n in nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output),
+            None
+        )
+        if output_node is None:
+            self.report({'ERROR'}, "Material has no active Material Output node.")
+            return {'CANCELLED'}
+
+        surface_input  = output_node.inputs['Surface']
+        saved_links    = [(lnk.from_node, lnk.from_socket) for lnk in links if lnk.to_socket == surface_input]
+
+        emit_node = nodes.new('ShaderNodeEmission')
+        emit_node.label    = '__node_bake_tmp__'
+        emit_node.location = (output_node.location.x - 200, output_node.location.y - 200)
+
+        # Wire source → Emission Color (for RGBA) or Strength (for VALUE)
+        if source_socket.type == 'RGBA':
+            links.new(source_socket, emit_node.inputs['Color'])
+            emit_node.inputs['Strength'].default_value = 1.0
+        else:
+            links.new(source_socket, emit_node.inputs['Strength'])
+            emit_node.inputs['Color'].default_value = (1, 1, 1, 1)
+
+        links.new(emit_node.outputs['Emission'], surface_input)
+
+        # Set bake target image on material
+        bake_tex = nodes.new('ShaderNodeTexImage')
+        bake_tex.label    = '__bake_target__'
+        bake_tex.image    = img
+        bake_tex.location = (emit_node.location.x - 300, emit_node.location.y)
+        for n in nodes:
+            n.select = False
+        bake_tex.select = True
+        nodes.active = bake_tex
+
+        # --- Bake EMIT (object's own material, no Selected-to-Active) ---
+        orig_engine = context.scene.render.engine
+        context.scene.render.engine = 'CYCLES'
+
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        try:
+            with context.temp_override(area=view3d_area, region=view3d_region):
+                bpy.ops.object.bake(
+                    type='EMIT',
+                    use_selected_to_active=False,
+                    width=res, height=res,
+                    margin=s.margin,
+                    margin_type=s.margin_type,
+                    use_clear=True,
+                    target='IMAGE_TEXTURES',
+                )
+
+            path = _save_image(img, s.output_dir, img_name)
+            self.report({'INFO'}, f"Baked node '{node_label}' → {path}")
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Node bake failed: {e}")
+            return {'CANCELLED'}
+
+        finally:
+            context.scene.render.engine = orig_engine
+
+            # Restore material
+            for lnk in list(links):
+                if lnk.to_socket == surface_input and lnk.from_node == emit_node:
+                    links.remove(lnk)
+            for from_node, from_socket in saved_links:
+                links.new(from_socket, surface_input)
+            nodes.remove(emit_node)
+            nodes.remove(bake_tex)
+
+        return {'FINISHED'}
+
+
 class BAKER_OT_AutoCageOffset(Operator):
     bl_idname  = "baker.auto_cage_offset"
     bl_label   = "Auto Offset"
@@ -1730,7 +1881,7 @@ def _dirty_icon(is_clean):
 # ---------------------------------------------------------------------------
 
 class BAKER_PT_Main(Panel):
-    bl_label       = "Grillen v1.9.8"
+    bl_label       = "Grillen v1.10.0"
     bl_idname      = "BAKER_PT_main"
     bl_space_type  = _SPACE
     bl_region_type = _REGION
@@ -1829,6 +1980,18 @@ class BAKER_PT_Main(Panel):
 
         box.separator(factor=0.3)
         box.prop(s, "skip_clean_maps")
+
+        layout.separator(factor=0.6)
+
+        # ── BAKE SELECTED NODE ──────────────────────────────────
+        node_box = layout.box()
+        hdr = node_box.row(align=True)
+        hdr.scale_y = 0.85
+        hdr.label(text="NODE BAKE", icon='NODE_COMPOSITING')
+        node_box.operator("baker.bake_selected_node", text="Bake Active Node", icon='EXPORT')
+        hint = node_box.row()
+        hint.scale_y = 0.65
+        hint.label(text="Select node in Shader Editor first", icon='INFO')
 
         layout.separator(factor=0.6)
 
@@ -2045,6 +2208,7 @@ classes = (
     BAKER_OT_QueueClear,
     BAKER_OT_BakeQueue,
     BAKER_OT_Bake,
+    BAKER_OT_BakeSelectedNode,
     BAKER_OT_AutoCageOffset,
     BAKER_OT_GenerateCage,
     BAKER_PT_Main,

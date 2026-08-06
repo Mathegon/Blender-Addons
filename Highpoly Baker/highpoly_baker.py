@@ -1940,21 +1940,26 @@ class BAKER_PT_Main(Panel):
         box.separator(factor=0.3)
 
         MAPS = [
-            ('bake_normals',   'Normal',    'NORMALS_FACE', s.normal_baked),
-            ('bake_ao',        'AO',        'LIGHT_SUN',    s.ao_baked),
+            ('bake_normals',   'Normal',  'NORMALS_FACE', s.normal_baked),
+            ('bake_ao',        'AO',      'LIGHT_SUN',    s.ao_baked),
             ('bake_diffuse',   'Diffuse',   'IMAGE_RGB',    s.diffuse_baked),
-            ('bake_roughness', 'Roughness', 'ANTIALIASED',  s.roughness_baked),
-            ('bake_metalness', 'Metalness', 'MATFLUID',     s.metalness_baked),
-            ('bake_alpha',     'Alpha',     'IMAGE_ALPHA',  s.alpha_baked),
+            ('bake_roughness', 'Roughness','ANTIALIASED',  s.roughness_baked),
+            ('bake_metalness', 'Metalness','MATFLUID',     s.metalness_baked),
+            ('bake_alpha',     'Alpha',   'IMAGE_ALPHA',  s.alpha_baked),
         ]
 
-        grid = box.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
-        grid.scale_y = 1.2
-        for prop, label, icon, is_clean in MAPS:
-            enabled = getattr(s, prop)
-            btn = grid.row(align=True)
-            btn.alert = enabled and not is_clean
-            btn.prop(s, prop, text=label, icon=icon, toggle=True)
+        col = box.column(align=True)
+        col.scale_y = 1.2
+        for i in range(0, len(MAPS), 2):
+            row = col.row(align=True)
+            for j in range(2):
+                if i + j < len(MAPS):
+                    prop, label, icon, is_clean = MAPS[i + j]
+                    enabled = getattr(s, prop)
+                    sub = row.row(align=True)
+                    sub.ui_units_x = 5.5
+                    sub.alert = enabled and not is_clean
+                    sub.prop(s, prop, text=label, icon=icon, toggle=True)
 
         if s.bake_normals:
             box.separator(factor=0.4)

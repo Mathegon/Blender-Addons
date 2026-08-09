@@ -10,6 +10,17 @@ Build and assign a Blender material using the baked maps.
 Process a queue of high/low-poly pairs.
 Improve normal/alpha maps with 2× supersampling; normal vectors are correctly re-normalized after downsampling.
 
+
+v2.0.0 — four new export controls in the Output sub-panel:
+
+Format — PNG, TGA, or EXR dropdown. File extension changes automatically (.png, .tga, .exr).
+
+Bit Depth — 8-bit, 16-bit, or 32-bit. Automatically clamped to what the format supports: TGA is always 8-bit (greyed out), PNG caps at 16-bit, EXR starts at 16-bit. Uses save_render() instead of save() so the scene's color depth setting is respected.
+
+Normal Convention — OpenGL (Y+) or DirectX (Y-). When set to DirectX, the green channel is inverted after baking and before saving (1.0 - green per pixel). This happens transparently — you always bake in Blender's native OpenGL format, and the flip is applied as a post-process. Useful for Unreal Engine, 3ds Max, and any DirectX-convention pipeline.
+
+Pack ORM — checkbox. After all passes complete, if any combination of AO, Roughness, or Metalness was baked, packs them into a single RGB image: R=AO, G=Roughness, B=Metallic. Saves as ObjectName_ORM.png/tga/exr alongside the individual maps. Missing channels default to white (1.0). The standard format for Unreal Engine and optimised PBR workflows that use a single ORM texture instead of three separate ones.
+
 v1.10.0 — new Bake Active Node feature. Here's how it works:
 
 Workflow:

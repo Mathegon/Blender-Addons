@@ -141,6 +141,9 @@ class BAKER_PG_Settings(PropertyGroup):
             ('MATERIAL', "Material Alpha",
              "Read the Alpha value from the high-poly Principled BSDF. "
              "Best when the high-poly already has an alpha texture."),
+            ('COMBINED', "Combined (Geometry × Material)",
+             "Bakes both geometry presence and material alpha, then multiplies them. "
+             "Use when the model has both physical holes AND transparent materials."),
         ],
         default='GEOMETRY',
     )
@@ -1440,45 +1443,125 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
                 metalness_restore = _setup_metalness_bake(highs)
                 actual_bake_type  = 'EMIT'
             elif bake_type == 'ALPHA':
-                alpha_restore    = _setup_alpha_bake(highs, s.alpha_mode)
                 actual_bake_type = 'EMIT'
+                effective_mode   = s.alpha_mode
 
-                if s.alpha_mode == 'GEOMETRY':
-                    # For a closed/hollow high-poly, rays that pass through holes
-                    # in the near face will hit the far wall instead, baking it
-                    # as solid white (wrong). Fix: clamp max_ray_distance to just
-                    # past the near face so rays can't reach the far wall.
-                    #
-                    # Strategy:
-                    # 1. Use find_nearest to get the actual surface gap (near face dist)
-                    # 2. Set max_ray_distance = gap * 3  (enough to catch near face
-                    #    geometry even when slightly offset, but stops well before far wall)
-                    # 3. Keep a small cage_extrusion to push ray origins outside surface
+                if effective_mode == 'COMBINED':
+                    # ── Two-pass combined alpha: GEOMETRY × MATERIAL ──
+                    # Pass 1: Geometry presence
+                    operator.report({'INFO'}, "Alpha combined: baking geometry pass...")
+                    alpha_restore = _setup_alpha_bake(highs, 'GEOMETRY')
 
                     gap = _auto_ray_distances(context, highs, low, max_samples=200)
                     if gap:
-                        near_dist = gap[0]  # p95 * 1.25 of surface gap
-                        # Extrusion: just enough to clear the surface
-                        alpha_extrusion = near_dist
-                        # Max ray distance: 3× the gap — catches the near face
-                        # even from slightly off-center positions, but nowhere
-                        # near the far wall of a closed object
-                        alpha_max_ray_dist = near_dist * 3.0
-                        operator.report({'INFO'},
-                            f"Alpha geometry: extrusion={alpha_extrusion:.4f}, "
-                            f"max_ray_dist={alpha_max_ray_dist:.4f} "
-                            f"(auto-limited to near face only)"
-                        )
+                        alpha_extrusion    = gap[0]
+                        alpha_max_ray_dist = gap[0] * 3.0
                     else:
-                        # Fallback if no geometry found
                         alpha_extrusion    = max(cage_extrusion, 0.02)
                         alpha_max_ray_dist = alpha_extrusion * 3.0
+
+                    geo_img = _make_image(img_name + "__geo__", bake_res, is_data=True, overwrite=True)
+                    _set_active_image_node(low, geo_img)
+
+                    bpy.ops.object.select_all(action='DESELECT')
+                    for h in highs: h.select_set(True)
+                    low.select_set(True)
+                    context.view_layer.objects.active = low
+
+                    geo_kwargs = dict(
+                        type='EMIT', pass_filter=set(),
+                        use_selected_to_active=True,
+                        max_ray_distance=alpha_max_ray_dist,
+                        width=bake_res, height=bake_res,
+                        margin=0, margin_type=s.margin_type,
+                        use_clear=True, target='IMAGE_TEXTURES',
+                    )
+                    if cage_obj:
+                        geo_kwargs['use_cage']    = True
+                        geo_kwargs['cage_object'] = cage_obj.name
+                    else:
+                        geo_kwargs['cage_extrusion'] = alpha_extrusion
+
+                    try:
+                        with context.temp_override(area=view3d_area, region=view3d_region):
+                            bpy.ops.object.bake(**geo_kwargs)
+                    finally:
+                        _restore_alpha_bake(alpha_restore)
+                        alpha_restore = None
+
+                    # Pass 2: Material alpha
+                    operator.report({'INFO'}, "Alpha combined: baking material pass...")
+                    alpha_restore = _setup_alpha_bake(highs, 'MATERIAL')
+
+                    mat_img = _make_image(img_name + "__mat__", bake_res, is_data=True, overwrite=True)
+                    _set_active_image_node(low, mat_img)
+
+                    bpy.ops.object.select_all(action='DESELECT')
+                    for h in highs: h.select_set(True)
+                    low.select_set(True)
+                    context.view_layer.objects.active = low
+
+                    mat_kwargs = dict(
+                        type='EMIT', pass_filter=set(),
+                        use_selected_to_active=True,
+                        max_ray_distance=max_ray_distance,
+                        width=bake_res, height=bake_res,
+                        margin=0, margin_type=s.margin_type,
+                        use_clear=True, target='IMAGE_TEXTURES',
+                    )
+                    if cage_obj:
+                        mat_kwargs['use_cage']    = True
+                        mat_kwargs['cage_object'] = cage_obj.name
+                    else:
+                        mat_kwargs['cage_extrusion'] = cage_extrusion
+
+                    try:
+                        with context.temp_override(area=view3d_area, region=view3d_region):
+                            bpy.ops.object.bake(**mat_kwargs)
+                    finally:
+                        _restore_alpha_bake(alpha_restore)
+                        alpha_restore = None
+
+                    # Multiply the two passes into the final image
+                    import numpy as np
+                    geo_px = np.array(geo_img.pixels[:], dtype=np.float32).reshape(-1, 4)
+                    mat_px = np.array(mat_img.pixels[:], dtype=np.float32).reshape(-1, 4)
+                    combined = geo_px.copy()
+                    combined[:, :3] = geo_px[:, :3] * mat_px[:, :3]
+                    img.pixels = combined.ravel().tolist()
+
+                    # Clean up temp images
+                    bpy.data.images.remove(geo_img)
+                    bpy.data.images.remove(mat_img)
+
+                    operator.report({'INFO'}, "Alpha combined: geometry × material merged.")
+                    # Skip the normal bake call below — already done
+                    actual_bake_type = '__SKIP__'
+
+                else:
+                    # Single-mode alpha (GEOMETRY or MATERIAL)
+                    alpha_restore = _setup_alpha_bake(highs, effective_mode)
+
+                    if effective_mode == 'GEOMETRY':
+                        gap = _auto_ray_distances(context, highs, low, max_samples=200)
+                        if gap:
+                            near_dist = gap[0]
+                            alpha_extrusion    = near_dist
+                            alpha_max_ray_dist = near_dist * 3.0
+                            operator.report({'INFO'},
+                                f"Alpha geometry: extrusion={alpha_extrusion:.4f}, "
+                                f"max_ray_dist={alpha_max_ray_dist:.4f} "
+                                f"(auto-limited to near face only)"
+                            )
+                        else:
+                            alpha_extrusion    = max(cage_extrusion, 0.02)
+                            alpha_max_ray_dist = alpha_extrusion * 3.0
 
             bake_kwargs = dict(
                 type=actual_bake_type,
                 pass_filter=pass_filter,
                 use_selected_to_active=True,
-                max_ray_distance=(alpha_max_ray_dist if bake_type == 'ALPHA' and s.alpha_mode == 'GEOMETRY' else max_ray_distance),
+                max_ray_distance=(alpha_max_ray_dist if bake_type == 'ALPHA' and s.alpha_mode in ('GEOMETRY',) else max_ray_distance),
                 width=bake_res, height=bake_res,
                 # Alpha: no margin — bleeding white into black gaps widens
                 # cutout edges beyond the actual high-poly geometry boundary
@@ -1495,16 +1578,20 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
                     alpha_extrusion if bake_type == 'ALPHA' else cage_extrusion
                 )
 
-            try:
-                with context.temp_override(area=view3d_area, region=view3d_region):
-                    bpy.ops.object.bake(**bake_kwargs)
-            finally:
-                if diffuse_restore is not None:
-                    _restore_diffuse_bake(diffuse_restore)
-                if metalness_restore is not None:
-                    _restore_metalness_bake(metalness_restore)
-                if alpha_restore is not None:
-                    _restore_alpha_bake(alpha_restore)
+            # COMBINED alpha already baked above — skip the regular bake call
+            if actual_bake_type == '__SKIP__':
+                pass
+            else:
+                try:
+                    with context.temp_override(area=view3d_area, region=view3d_region):
+                        bpy.ops.object.bake(**bake_kwargs)
+                finally:
+                    if diffuse_restore is not None:
+                        _restore_diffuse_bake(diffuse_restore)
+                    if metalness_restore is not None:
+                        _restore_metalness_bake(metalness_restore)
+                    if alpha_restore is not None:
+                        _restore_alpha_bake(alpha_restore)
 
             # Post-processing: supersample downsample (+ gaussian smooth for alpha)
             final_img = img

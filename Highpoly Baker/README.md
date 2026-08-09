@@ -11,6 +11,7 @@ Process a queue of high/low-poly pairs.
 Improve normal/alpha maps with 2× supersampling; normal vectors are correctly re-normalized after downsampling.
 
 
+
 v2.0.0 — four new export controls in the Output sub-panel:
 
 Format — PNG, TGA, or EXR dropdown. File extension changes automatically (.png, .tga, .exr).

@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "GRILLEN v1.10.0",
+    "name": "GRILLEN v2.0.0",
     "author": "Claude",
-    "version": (1, 10, 0),
+    "version": (2, 0, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Grillen",
     "description": (
@@ -306,6 +306,46 @@ class BAKER_PG_Settings(PropertyGroup):
         default="",
     )
 
+    output_format: EnumProperty(
+        name="Format",
+        description="Image file format for baked textures",
+        items=[
+            ('PNG',      "PNG",  "Lossless, widely supported, 8/16-bit"),
+            ('TARGA',    "TGA",  "Uncompressed, fast, 8-bit only"),
+            ('OPEN_EXR', "EXR",  "HDR format, 16/32-bit float, best for linear data"),
+        ],
+        default='PNG',
+    )
+
+    output_depth: EnumProperty(
+        name="Bit Depth",
+        description="Color depth per channel",
+        items=[
+            ('8',  "8-bit",   "Standard, smallest files"),
+            ('16', "16-bit",  "Higher precision, good for normals"),
+            ('32', "32-bit",  "Full float (EXR only)"),
+        ],
+        default='8',
+    )
+
+    normal_convention: EnumProperty(
+        name="Normal Convention",
+        description="Normal map Y-axis convention",
+        items=[
+            ('OPENGL',  "OpenGL (Y+)",  "Green channel as-is — Blender, Maya, Unity default"),
+            ('DIRECTX', "DirectX (Y-)", "Green channel inverted — Unreal, 3ds Max, DirectX"),
+        ],
+        default='OPENGL',
+    )
+
+    export_orm: BoolProperty(
+        name="Pack ORM",
+        description="Export an additional packed ORM texture: "
+                    "R=Ambient Occlusion, G=Roughness, B=Metallic. "
+                    "Common for Unreal Engine and optimised PBR pipelines.",
+        default=False,
+    )
+
     # ── Bake queue ──────────────────────────────────────────────────────────
     queue: CollectionProperty(type=BAKER_PG_QueueItem)
     queue_index: IntProperty(name="Active Queue Item", default=0)
@@ -373,13 +413,88 @@ def _set_active_image_node(obj, img):
         nodes.active = bake_node
 
 
-def _save_image(img, output_dir, filename):
+def _save_image(img, output_dir, filename, fmt='PNG', depth='8'):
+    """Save image to disk with the specified format and bit depth."""
+    EXT = {'PNG': '.png', 'TARGA': '.tga', 'OPEN_EXR': '.exr'}
     folder = output_dir.strip() or bpy.app.tempdir
     os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, filename + ".png")
+
+    ext  = EXT.get(fmt, '.png')
+    path = os.path.join(folder, filename + ext)
+
     img.filepath_raw = path
-    img.file_format = 'PNG'
-    img.save()
+    img.file_format  = fmt
+
+    # Clamp bit depth to what the format supports
+    if fmt == 'TARGA':
+        depth = '8'
+    elif fmt == 'PNG' and depth == '32':
+        depth = '16'
+    elif fmt == 'OPEN_EXR' and depth == '8':
+        depth = '16'
+
+    if hasattr(img, 'use_half_precision'):
+        img.use_half_precision = (depth == '16' and fmt == 'OPEN_EXR')
+
+    # Set color depth on the image file output settings
+    scene = bpy.context.scene
+    orig_format = scene.render.image_settings.file_format
+    orig_depth  = scene.render.image_settings.color_depth
+    scene.render.image_settings.file_format  = fmt
+    scene.render.image_settings.color_depth  = depth
+    img.save_render(path, scene=scene)
+    scene.render.image_settings.file_format  = orig_format
+    scene.render.image_settings.color_depth  = orig_depth
+
+    return path
+
+
+def _flip_normal_green_channel(img):
+    """Invert the green (Y) channel for DirectX normal map convention."""
+    import numpy as np
+    w, h = img.size
+    pixels = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+    pixels[:, :, 1] = 1.0 - pixels[:, :, 1]  # flip green
+    img.pixels = pixels.ravel().tolist()
+
+
+def _pack_orm(ao_img, rough_img, metal_img, output_dir, filename, fmt='PNG', depth='8'):
+    """
+    Pack AO/Roughness/Metallic into a single RGB image:
+      R = Ambient Occlusion
+      G = Roughness
+      B = Metallic
+    Creates and saves a new image, returns the path.
+    """
+    import numpy as np
+
+    # Use the first available image's resolution
+    ref = ao_img or rough_img or metal_img
+    if ref is None:
+        return None
+    w, h = ref.size
+
+    orm = np.ones((h, w, 4), dtype=np.float32)
+
+    def get_channel(img):
+        if img is None:
+            return np.ones((h, w), dtype=np.float32)
+        p = np.array(img.pixels[:], dtype=np.float32).reshape(img.size[1], img.size[0], 4)
+        if p.shape[:2] != (h, w):
+            # Resolution mismatch — return white
+            return np.ones((h, w), dtype=np.float32)
+        return p[:, :, 0]  # use red channel (greyscale data)
+
+    orm[:, :, 0] = get_channel(ao_img)     # R = AO
+    orm[:, :, 1] = get_channel(rough_img)  # G = Roughness
+    orm[:, :, 2] = get_channel(metal_img)  # B = Metallic
+    orm[:, :, 3] = 1.0
+
+    orm_img = bpy.data.images.new(filename, w, h, alpha=False, is_data=True)
+    orm_img.colorspace_settings.name = 'Non-Color'
+    orm_img.pixels = orm.ravel().tolist()
+
+    path = _save_image(orm_img, output_dir, filename, fmt=fmt, depth=depth)
     return path
 
 
@@ -402,71 +517,115 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
     links = mat.node_tree.links
     nodes.clear()
 
-    out  = nodes.new('ShaderNodeOutputMaterial'); out.location  = (700, 0)
-    bsdf = nodes.new('ShaderNodeBsdfPrincipled'); bsdf.location = (350, 0)
+    # ── Layout grid ──────────────────────────────────────────
+    # Column positions (X):
+    TEX_X   = -600     # texture image nodes
+    MID_X   = -200     # processing nodes (Normal Map, AO Mix)
+    BSDF_X  =  200     # Principled BSDF
+    OUT_X   =  500     # Material Output
+    # Row spacing (Y):
+    ROW_H   =  280     # vertical spacing between texture rows
+    TEX_W   =  250     # node width for textures
+
+    # Start row positions from top
+    row_y = 300
+
+    # ── Output + BSDF ────────────────────────────────────────
+    out  = nodes.new('ShaderNodeOutputMaterial')
+    out.location = (OUT_X, 0)
+
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.location = (BSDF_X, 0)
     links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
 
-    if 'NORMAL' in baked_images:
-        tex = nodes.new('ShaderNodeTexImage'); tex.location = (-500, -250)
-        tex.image = baked_images['NORMAL']
-        tex.image.colorspace_settings.name = 'Non-Color'
-        tex.label = 'Normal Map Tex'
-        nm  = nodes.new('ShaderNodeNormalMap'); nm.location = (0, -250)
-        links.new(tex.outputs['Color'], nm.inputs['Color'])
-        links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
-
+    # ── Diffuse / Base Color ─────────────────────────────────
     diff_tex = None
     if 'DIFFUSE' in baked_images:
-        diff_tex = nodes.new('ShaderNodeTexImage'); diff_tex.location = (-500, 300)
-        diff_tex.image = baked_images['DIFFUSE']
-        diff_tex.label = 'Diffuse Tex'
+        diff_tex = nodes.new('ShaderNodeTexImage')
+        diff_tex.location = (TEX_X, row_y)
+        diff_tex.width    = TEX_W
+        diff_tex.image    = baked_images['DIFFUSE']
+        diff_tex.label    = 'Diffuse'
+        row_y -= ROW_H
 
-    if 'ROUGHNESS' in baked_images:
-        tex = nodes.new('ShaderNodeTexImage'); tex.location = (-500, 0)
-        tex.image = baked_images['ROUGHNESS']
-        tex.image.colorspace_settings.name = 'Non-Color'
-        tex.label = 'Roughness Tex'
-        links.new(tex.outputs['Color'], bsdf.inputs['Roughness'])
+    # ── AO ───────────────────────────────────────────────────
+    ao_tex = None
+    if 'AO' in baked_images:
+        ao_tex = nodes.new('ShaderNodeTexImage')
+        ao_tex.location = (TEX_X, row_y)
+        ao_tex.width    = TEX_W
+        ao_tex.image    = baked_images['AO']
+        ao_tex.image.colorspace_settings.name = 'Non-Color'
+        ao_tex.label    = 'AO'
+        row_y -= ROW_H
 
+    # Wire Base Color: Diffuse * AO, or Diffuse alone, or AO alone
+    if diff_tex and ao_tex:
+        mix = nodes.new('ShaderNodeMixRGB')
+        mix.location    = (MID_X, diff_tex.location.y)
+        mix.blend_type  = 'MULTIPLY'
+        mix.inputs['Fac'].default_value = 1.0
+        links.new(diff_tex.outputs['Color'], mix.inputs['Color1'])
+        links.new(ao_tex.outputs['Color'],   mix.inputs['Color2'])
+        links.new(mix.outputs['Color'],      bsdf.inputs['Base Color'])
+    elif diff_tex:
+        links.new(diff_tex.outputs['Color'], bsdf.inputs['Base Color'])
+    elif ao_tex:
+        links.new(ao_tex.outputs['Color'],   bsdf.inputs['Base Color'])
+
+    # ── Metalness ────────────────────────────────────────────
     if 'METALNESS' in baked_images:
-        tex = nodes.new('ShaderNodeTexImage'); tex.location = (-500, -150)
-        tex.image = baked_images['METALNESS']
+        tex = nodes.new('ShaderNodeTexImage')
+        tex.location = (TEX_X, row_y)
+        tex.width    = TEX_W
+        tex.image    = baked_images['METALNESS']
         tex.image.colorspace_settings.name = 'Non-Color'
-        tex.label = 'Metalness Tex'
+        tex.label    = 'Metalness'
         links.new(tex.outputs['Color'], bsdf.inputs['Metallic'])
+        row_y -= ROW_H
 
-    if 'ALPHA' in baked_images:
-        tex = nodes.new('ShaderNodeTexImage'); tex.location = (-500, -300)
-        tex.image = baked_images['ALPHA']
+    # ── Roughness ────────────────────────────────────────────
+    if 'ROUGHNESS' in baked_images:
+        tex = nodes.new('ShaderNodeTexImage')
+        tex.location = (TEX_X, row_y)
+        tex.width    = TEX_W
+        tex.image    = baked_images['ROUGHNESS']
         tex.image.colorspace_settings.name = 'Non-Color'
-        tex.label = 'Alpha Tex'
+        tex.label    = 'Roughness'
+        links.new(tex.outputs['Color'], bsdf.inputs['Roughness'])
+        row_y -= ROW_H
+
+    # ── Normal Map ───────────────────────────────────────────
+    if 'NORMAL' in baked_images:
+        tex = nodes.new('ShaderNodeTexImage')
+        tex.location = (TEX_X, row_y)
+        tex.width    = TEX_W
+        tex.image    = baked_images['NORMAL']
+        tex.image.colorspace_settings.name = 'Non-Color'
+        tex.label    = 'Normal Map'
+        nm  = nodes.new('ShaderNodeNormalMap')
+        nm.location  = (MID_X, row_y)
+        links.new(tex.outputs['Color'], nm.inputs['Color'])
+        links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
+        row_y -= ROW_H
+
+    # ── Alpha ────────────────────────────────────────────────
+    if 'ALPHA' in baked_images:
+        tex = nodes.new('ShaderNodeTexImage')
+        tex.location = (TEX_X, row_y)
+        tex.width    = TEX_W
+        tex.image    = baked_images['ALPHA']
+        tex.image.colorspace_settings.name = 'Non-Color'
+        tex.label    = 'Alpha'
         links.new(tex.outputs['Color'], bsdf.inputs['Alpha'])
-        # Enable alpha blending so transparency is visible in viewport
-        # HASHED gives smoother alpha edges than CLIP — better for wires/nets
-        mat.blend_method      = 'HASHED'
-        mat.use_backface_culling = False   # show both sides through alpha holes
-        # shadow_method was removed in Blender 4.0
+        # Viewport alpha display
+        mat.blend_method         = 'HASHED'
+        mat.use_backface_culling = False
         if hasattr(mat, 'shadow_method'):
             mat.shadow_method = 'HASHED'
         else:
             mat.use_transparent_shadow = True
-
-    if 'AO' in baked_images:
-        ao_tex = nodes.new('ShaderNodeTexImage'); ao_tex.location = (-500, -550)
-        ao_tex.image = baked_images['AO']
-        ao_tex.image.colorspace_settings.name = 'Non-Color'
-        ao_tex.label = 'AO Tex'
-        if diff_tex is not None:
-            mix = nodes.new('ShaderNodeMixRGB'); mix.location = (0, 300)
-            mix.blend_type = 'MULTIPLY'
-            mix.inputs['Fac'].default_value = 1.0
-            links.new(diff_tex.outputs['Color'], mix.inputs['Color1'])
-            links.new(ao_tex.outputs['Color'],   mix.inputs['Color2'])
-            links.new(mix.outputs['Color'],      bsdf.inputs['Base Color'])
-        else:
-            links.new(ao_tex.outputs['Color'], bsdf.inputs['Base Color'])
-    elif diff_tex is not None:
-        links.new(diff_tex.outputs['Color'], bsdf.inputs['Base Color'])
+        row_y -= ROW_H
 
     _assign_baked_material(low_obj, mat, preserve_materials)
     return mat
@@ -665,11 +824,16 @@ def _estimate_cage_faces(high_objects, poly_size, offset):
     return 2 * (nx * ny) + 2 * (nx * nz) + 2 * (ny * nz)
 
 
-def _setup_metalness_bake(high_objects):
+def _setup_diffuse_bake(high_objects):
     """
-    For each material on each high-poly object: temporarily connect
-    Metallic → Emission so we can bake it via EMIT.
-    Returns a list of (mat, node_tree, temp_nodes, saved_links) to restore.
+    For each material on each high-poly: temporarily wire the Base Color
+    source → Emission → Material Output so we can bake it via EMIT.
+
+    Handles node Groups by adding a temporary Color output to the group
+    interface, wiring the internal Base Color source to it, then connecting
+    it to an Emission node on the outside.
+
+    Returns restore data for _restore_diffuse_bake.
     """
     restore_data = []
 
@@ -682,67 +846,249 @@ def _setup_metalness_bake(high_objects):
             nodes = mat.node_tree.nodes
             links = mat.node_tree.links
 
-            bsdf = next(
-                (n for n in nodes if n.type == 'BSDF_PRINCIPLED'),
-                None
-            )
-            if bsdf is None:
-                continue
-
-            # Find the Metallic input socket
-            metallic_input = bsdf.inputs.get('Metallic')
-            if metallic_input is None:
-                continue
-
-            # Remember existing links into the Metallic socket
-            existing_links = [
-                (lnk.from_node, lnk.from_socket)
-                for lnk in links
-                if lnk.to_socket == metallic_input
-            ]
-            existing_default = metallic_input.default_value
-
-            # Find or create an Emission node
-            emit_node = nodes.new('ShaderNodeEmission')
-            emit_node.label = '__metalness_bake__'
-            emit_node.location = (bsdf.location.x - 250, bsdf.location.y - 400)
-
-            # Find the Material Output
             output = next(
                 (n for n in nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output),
                 None
             )
             if output is None:
-                nodes.remove(emit_node)
                 continue
 
-            # Save the existing link into Surface
             surface_input = output.inputs['Surface']
+            saved_links   = [(lnk.from_node, lnk.from_socket)
+                             for lnk in links if lnk.to_socket == surface_input]
+
+            color_socket    = None   # outer socket to wire to Emission
+            group_cleanup   = None   # data for removing temp group output
+
+            # --- Strategy 1: direct Principled BSDF (no group) ---
+            bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            if bsdf:
+                bc = bsdf.inputs.get('Base Color')
+                if bc:
+                    for lnk in links:
+                        if lnk.to_socket == bc:
+                            color_socket = lnk.from_socket
+                            break
+                    if color_socket is None:
+                        # No connection — will use default color below
+                        pass
+
+            # --- Strategy 2: Group node — go inside and extract ---
+            if color_socket is None:
+                group = next((n for n in nodes if n.type == 'GROUP'), None)
+                if group and group.node_tree:
+                    inner_tree  = group.node_tree
+                    inner_nodes = inner_tree.nodes
+                    inner_links = inner_tree.links
+
+                    inner_bsdf = next(
+                        (n for n in inner_nodes if n.type == 'BSDF_PRINCIPLED'), None
+                    )
+                    inner_bc_source = None
+
+                    if inner_bsdf:
+                        inner_bc = inner_bsdf.inputs.get('Base Color')
+                        if inner_bc:
+                            for lnk in inner_links:
+                                if lnk.to_socket == inner_bc:
+                                    inner_bc_source = lnk.from_socket
+                                    break
+
+                    if inner_bc_source:
+                        # Add a temporary Color output to the group
+                        temp_socket = inner_tree.interface.new_socket(
+                            name="__bake_color__",
+                            in_out='OUTPUT',
+                            socket_type='NodeSocketColor',
+                        )
+                        group_output = next(
+                            (n for n in inner_nodes if n.type == 'GROUP_OUTPUT'), None
+                        )
+                        if group_output:
+                            inner_tree.links.new(
+                                inner_bc_source,
+                                group_output.inputs['__bake_color__']
+                            )
+                            # The new output is now accessible on the group node outside
+                            color_socket = group.outputs.get('__bake_color__')
+
+                            group_cleanup = {
+                                'inner_tree':   inner_tree,
+                                'temp_socket':  temp_socket,
+                                'group_output': group_output,
+                            }
+
+            # --- Build Emission node ---
+            emit_node = nodes.new('ShaderNodeEmission')
+            emit_node.label    = '__diffuse_bake__'
+            emit_node.location = (output.location.x - 200, output.location.y - 200)
+
+            if color_socket:
+                links.new(color_socket, emit_node.inputs['Color'])
+            else:
+                # Fallback: use default Base Color value
+                default_color = (0.8, 0.8, 0.8, 1.0)
+                if bsdf:
+                    bc = bsdf.inputs.get('Base Color')
+                    if bc:
+                        default_color = tuple(bc.default_value)
+                emit_node.inputs['Color'].default_value = default_color
+
+            emit_node.inputs['Strength'].default_value = 1.0
+            links.new(emit_node.outputs['Emission'], surface_input)
+
+            restore_data.append({
+                'mat':            mat,
+                'emit_node':      emit_node,
+                'surface_input':  surface_input,
+                'saved_links':    saved_links,
+                'group_cleanup':  group_cleanup,
+            })
+
+    return restore_data
+
+
+def _restore_diffuse_bake(restore_data):
+    """Undo _setup_diffuse_bake."""
+    for rd in restore_data:
+        mat       = rd['mat']
+        links     = mat.node_tree.links
+        nodes     = mat.node_tree.nodes
+        emit_node = rd['emit_node']
+        surf_in   = rd['surface_input']
+
+        for lnk in list(links):
+            if lnk.to_socket == surf_in and lnk.from_node == emit_node:
+                links.remove(lnk)
+        for from_node, from_socket in rd['saved_links']:
+            links.new(from_socket, surf_in)
+        nodes.remove(emit_node)
+
+        # Remove temporary group output if we created one
+        gc = rd.get('group_cleanup')
+        if gc:
+            inner_tree   = gc['inner_tree']
+            group_output = gc['group_output']
+            temp_socket  = gc['temp_socket']
+
+            # Remove the internal link to __bake_color__
+            bake_input = group_output.inputs.get('__bake_color__')
+            if bake_input:
+                for lnk in list(inner_tree.links):
+                    if lnk.to_socket == bake_input:
+                        inner_tree.links.remove(lnk)
+
+            # Remove the interface socket
+            inner_tree.interface.remove(temp_socket)
+
+
+def _setup_metalness_bake(high_objects):
+    """
+    For each material on each high-poly object: temporarily connect
+    Metallic → Emission so we can bake it via EMIT.
+    Handles node Groups by tunneling the internal Metallic value out.
+    """
+    restore_data = []
+
+    for obj in high_objects:
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None or not mat.use_nodes:
+                continue
+
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+
+            output = next(
+                (n for n in nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output),
+                None
+            )
+            if output is None:
+                continue
+
+            surface_input      = output.inputs['Surface']
             saved_surface_links = [
                 (lnk.from_node, lnk.from_socket)
-                for lnk in links
-                if lnk.to_socket == surface_input
+                for lnk in links if lnk.to_socket == surface_input
             ]
 
-            # Wire: Metallic value/link → Emission Strength → Output Surface
-            if existing_links:
-                from_node, from_socket = existing_links[0]
-                links.new(from_socket, emit_node.inputs['Strength'])
-            else:
-                emit_node.inputs['Strength'].default_value = existing_default
+            metallic_socket  = None   # outer socket carrying the metallic value
+            metallic_default = 0.0    # fallback constant
+            group_cleanup    = None
+
+            # --- Strategy 1: direct Principled BSDF ---
+            bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            if bsdf:
+                met_in = bsdf.inputs.get('Metallic')
+                if met_in:
+                    metallic_default = met_in.default_value
+                    for lnk in links:
+                        if lnk.to_socket == met_in:
+                            metallic_socket = lnk.from_socket
+                            break
+
+            # --- Strategy 2: Group node — go inside ---
+            if metallic_socket is None and bsdf is None:
+                group = next((n for n in nodes if n.type == 'GROUP'), None)
+                if group and group.node_tree:
+                    inner_tree  = group.node_tree
+                    inner_bsdf  = next(
+                        (n for n in inner_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None
+                    )
+                    if inner_bsdf:
+                        inner_met = inner_bsdf.inputs.get('Metallic')
+                        if inner_met:
+                            metallic_default = inner_met.default_value
+
+                            # Check if something is connected inside
+                            inner_source = None
+                            for lnk in inner_tree.links:
+                                if lnk.to_socket == inner_met:
+                                    inner_source = lnk.from_socket
+                                    break
+
+                            if inner_source:
+                                # Tunnel out through a temp group output
+                                temp_socket = inner_tree.interface.new_socket(
+                                    name="__bake_metallic__",
+                                    in_out='OUTPUT',
+                                    socket_type='NodeSocketFloat',
+                                )
+                                group_output = next(
+                                    (n for n in inner_tree.nodes if n.type == 'GROUP_OUTPUT'),
+                                    None
+                                )
+                                if group_output:
+                                    inner_tree.links.new(
+                                        inner_source,
+                                        group_output.inputs['__bake_metallic__']
+                                    )
+                                    metallic_socket = group.outputs.get('__bake_metallic__')
+                                    group_cleanup = {
+                                        'inner_tree':   inner_tree,
+                                        'temp_socket':  temp_socket,
+                                        'group_output': group_output,
+                                    }
+
+            # --- Build Emission node ---
+            emit_node = nodes.new('ShaderNodeEmission')
+            emit_node.label    = '__metalness_bake__'
+            emit_node.location = (output.location.x - 200, output.location.y - 200)
             emit_node.inputs['Color'].default_value = (1, 1, 1, 1)
+
+            if metallic_socket:
+                links.new(metallic_socket, emit_node.inputs['Strength'])
+            else:
+                emit_node.inputs['Strength'].default_value = metallic_default
 
             links.new(emit_node.outputs['Emission'], surface_input)
 
             restore_data.append({
                 'mat':                 mat,
                 'emit_node':           emit_node,
-                'output':              output,
                 'surface_input':       surface_input,
                 'saved_surface_links': saved_surface_links,
-                'metallic_input':      metallic_input,
-                'existing_links':      existing_links,
-                'existing_default':    existing_default,
+                'group_cleanup':       group_cleanup,
             })
 
     return restore_data
@@ -751,23 +1097,31 @@ def _setup_metalness_bake(high_objects):
 def _restore_metalness_bake(restore_data):
     """Undo the temporary node wiring set up by _setup_metalness_bake."""
     for rd in restore_data:
-        mat          = rd['mat']
-        links        = mat.node_tree.links
-        nodes        = mat.node_tree.nodes
-        emit_node    = rd['emit_node']
-        surface_in   = rd['surface_input']
+        mat        = rd['mat']
+        links      = mat.node_tree.links
+        nodes      = mat.node_tree.nodes
+        emit_node  = rd['emit_node']
+        surface_in = rd['surface_input']
 
-        # Remove temporary emission link
         for lnk in list(links):
             if lnk.to_socket == surface_in and lnk.from_node == emit_node:
                 links.remove(lnk)
-
-        # Restore original surface links
         for from_node, from_socket in rd['saved_surface_links']:
             links.new(from_socket, surface_in)
-
-        # Remove temp emission node
         nodes.remove(emit_node)
+
+        # Remove temporary group output if we created one
+        gc = rd.get('group_cleanup')
+        if gc:
+            inner_tree   = gc['inner_tree']
+            group_output = gc['group_output']
+            temp_socket  = gc['temp_socket']
+            bake_input = group_output.inputs.get('__bake_metallic__')
+            if bake_input:
+                for lnk in list(inner_tree.links):
+                    if lnk.to_socket == bake_input:
+                        inner_tree.links.remove(lnk)
+            inner_tree.interface.remove(temp_socket)
 
 
 def _setup_alpha_bake(high_objects, mode):
@@ -977,6 +1331,14 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
     low_name = low.name
     _ensure_uv(low)
 
+    # Temporarily unhide source objects — hidden objects can't be selected
+    # for baking, which silently produces a black result.
+    hidden_objects = []
+    for obj in highs + [low]:
+        if obj.hide_get():
+            hidden_objects.append(obj)
+            obj.hide_set(False)
+
     cage_obj = None
     if not s.multi_source and s.use_generated_cage:
         cage_obj = _find_cage_for_high(highs[0])
@@ -1061,16 +1423,20 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
             low.select_set(True)
             context.view_layer.objects.active = low
 
-            pass_filter = {'COLOR'} if bake_type == 'DIFFUSE' else set()
+            pass_filter = set()
 
-            # Metalness: wire Metallic → Emission, bake as EMIT
+            # Special bake types: wire specific inputs → Emission, bake as EMIT
             metalness_restore    = None
             alpha_restore        = None
+            diffuse_restore      = None
             actual_bake_type     = bake_type
             alpha_extrusion      = cage_extrusion
             alpha_max_ray_dist   = max_ray_distance
 
-            if bake_type == 'METALNESS':
+            if bake_type == 'DIFFUSE':
+                diffuse_restore  = _setup_diffuse_bake(highs)
+                actual_bake_type = 'EMIT'
+            elif bake_type == 'METALNESS':
                 metalness_restore = _setup_metalness_bake(highs)
                 actual_bake_type  = 'EMIT'
             elif bake_type == 'ALPHA':
@@ -1133,6 +1499,8 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
                 with context.temp_override(area=view3d_area, region=view3d_region):
                     bpy.ops.object.bake(**bake_kwargs)
             finally:
+                if diffuse_restore is not None:
+                    _restore_diffuse_bake(diffuse_restore)
                 if metalness_restore is not None:
                     _restore_metalness_bake(metalness_restore)
                 if alpha_restore is not None:
@@ -1162,7 +1530,13 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
                 final_img = ds_img
                 baked_images_out[bake_type] = final_img
 
-            path = _save_image(final_img, s.output_dir, img_name)
+            # Normal map: flip green channel for DirectX convention
+            if bake_type == 'NORMAL' and s.normal_convention == 'DIRECTX':
+                operator.report({'INFO'}, "Normal: flipping green channel for DirectX...")
+                _flip_normal_green_channel(final_img)
+
+            path = _save_image(final_img, s.output_dir, img_name,
+                               fmt=s.output_format, depth=s.output_depth)
             saved_paths.append(path)
             baked_images_out[bake_type] = final_img
             operator.report({'INFO'}, f"Saved: {path}")
@@ -1178,6 +1552,26 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
     finally:
         bpy.app.handlers.object_bake_pre.remove(_pre_handler)
         wm.progress_end()
+
+        # Restore hidden state for objects we unhid
+        for obj in hidden_objects:
+            obj.hide_set(True)
+
+    # ORM packed texture export
+    if s.export_orm:
+        ao_img    = baked_images_out.get('AO')
+        rough_img = baked_images_out.get('ROUGHNESS')
+        metal_img = baked_images_out.get('METALNESS')
+        if ao_img or rough_img or metal_img:
+            orm_name = prefix + low_name + "_ORM"
+            orm_path = _pack_orm(
+                ao_img, rough_img, metal_img,
+                s.output_dir, orm_name,
+                fmt=s.output_format, depth=s.output_depth,
+            )
+            if orm_path:
+                saved_paths.append(orm_path)
+                operator.report({'INFO'}, f"ORM packed: {orm_path}")
 
     return saved_paths
 
@@ -1611,7 +2005,8 @@ class BAKER_OT_BakeSelectedNode(Operator):
                     target='IMAGE_TEXTURES',
                 )
 
-            path = _save_image(img, s.output_dir, img_name)
+            path = _save_image(img, s.output_dir, img_name,
+                               fmt=s.output_format, depth=s.output_depth)
             self.report({'INFO'}, f"Baked node '{node_label}' → {path}")
 
         except Exception as e:
@@ -1629,6 +2024,27 @@ class BAKER_OT_BakeSelectedNode(Operator):
                 links.new(from_socket, surface_input)
             nodes.remove(emit_node)
             nodes.remove(bake_tex)
+
+        # Insert the baked result as a new color-coded Image Texture node
+        result_node = nodes.new('ShaderNodeTexImage')
+        result_node.image    = img
+        result_node.label    = f"Baked: {node_label}"
+        result_node.name     = f"Baked_{safe_name}"
+        result_node.location = (
+            source_node.location.x,
+            source_node.location.y - 250,
+        )
+        result_node.width = 200
+
+        # Color-code: distinct green so baked nodes stand out
+        result_node.use_custom_color = True
+        result_node.color = (0.18, 0.55, 0.28)
+
+        # Select only the new node so it's easy to find
+        for n in nodes:
+            n.select = False
+        result_node.select = True
+        nodes.active = result_node
 
         return {'FINISHED'}
 
@@ -1881,7 +2297,7 @@ def _dirty_icon(is_clean):
 # ---------------------------------------------------------------------------
 
 class BAKER_PT_Main(Panel):
-    bl_label       = "Grillen v1.10.0"
+    bl_label       = "Grillen v2.0.0"
     bl_idname      = "BAKER_PT_main"
     bl_space_type  = _SPACE
     bl_region_type = _REGION
@@ -1948,18 +2364,20 @@ class BAKER_PT_Main(Panel):
             ('bake_alpha',     'Alpha',   'IMAGE_ALPHA',  s.alpha_baked),
         ]
 
-        col = box.column(align=True)
-        col.scale_y = 1.2
+        # Map buttons — constrained to 80% width via split, right side absorbs stretch
+        split = box.split(factor=0.8)
+        btn_col = split.column(align=True)
+        btn_col.scale_y = 1.2
         for i in range(0, len(MAPS), 2):
-            row = col.row(align=True)
+            row = btn_col.row(align=True)
             for j in range(2):
                 if i + j < len(MAPS):
                     prop, label, icon, is_clean = MAPS[i + j]
                     enabled = getattr(s, prop)
                     sub = row.row(align=True)
-                    sub.ui_units_x = 5.5
                     sub.alert = enabled and not is_clean
                     sub.prop(s, prop, text=label, icon=icon, toggle=True)
+        split.column()  # empty absorber
 
         if s.bake_normals:
             box.separator(factor=0.4)
@@ -1985,18 +2403,6 @@ class BAKER_PT_Main(Panel):
 
         box.separator(factor=0.3)
         box.prop(s, "skip_clean_maps")
-
-        layout.separator(factor=0.6)
-
-        # ── BAKE SELECTED NODE ──────────────────────────────────
-        node_box = layout.box()
-        hdr = node_box.row(align=True)
-        hdr.scale_y = 0.85
-        hdr.label(text="NODE BAKE", icon='NODE_COMPOSITING')
-        node_box.operator("baker.bake_selected_node", text="Bake Active Node", icon='EXPORT')
-        hint = node_box.row()
-        hint.scale_y = 0.65
-        hint.label(text="Select node in Shader Editor first", icon='INFO')
 
         layout.separator(factor=0.6)
 
@@ -2076,12 +2482,48 @@ class BAKER_PT_Output(Panel):
         layout = self.layout
         s      = context.scene.baker_settings
         _prop_split(layout)
+
+        # ── DESTINATION ──────────────────────────────────────────
         _section_header(layout, "DESTINATION", 'FILE_FOLDER')
         box = layout.box()
         _prop_split(box)
         col = box.column(align=True)
         col.prop(s, "output_dir", text="Folder")
         col.prop(s, "prefix",     text="Prefix")
+
+        layout.separator(factor=0.6)
+
+        # ── FORMAT ───────────────────────────────────────────────
+        _section_header(layout, "FORMAT", 'IMAGE_DATA')
+        box = layout.box()
+        _prop_split(box)
+        col = box.column(align=True)
+        col.prop(s, "output_format")
+        # Show only valid bit depths for the selected format
+        row = col.row(align=True)
+        if s.output_format == 'TARGA':
+            row.enabled = False
+        row.prop(s, "output_depth")
+
+        layout.separator(factor=0.6)
+
+        # ── NORMAL MAP ───────────────────────────────────────────
+        _section_header(layout, "NORMAL MAP", 'NORMALS_FACE')
+        box = layout.box()
+        _prop_split(box)
+        box.prop(s, "normal_convention")
+
+        layout.separator(factor=0.6)
+
+        # ── CHANNEL PACKING ──────────────────────────────────────
+        _section_header(layout, "CHANNEL PACKING", 'NODE_COMPOSITING')
+        box = layout.box()
+        _prop_split(box)
+        box.prop(s, "export_orm")
+        if s.export_orm:
+            hint = box.row()
+            hint.scale_y = 0.65
+            hint.label(text="R=AO  G=Roughness  B=Metallic", icon='INFO')
 
 
 class BAKER_PT_Queue(Panel):
@@ -2124,6 +2566,34 @@ class BAKER_PT_Queue(Panel):
         row.enabled = len([i for i in s.queue if i.enabled]) > 0
         row.scale_y = 1.5
         row.operator("baker.bake_queue", text="Bake Queue", icon='RENDER_ANIMATION')
+
+
+class BAKER_PT_NodeBake(Panel):
+    bl_label       = "Node Bake"
+    bl_idname      = "BAKER_PT_node_bake"
+    bl_space_type  = _SPACE
+    bl_region_type = _REGION
+    bl_category    = _CAT
+    bl_parent_id   = "BAKER_PT_main"
+    bl_options     = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon='NODE_COMPOSITING')
+
+    def draw(self, context):
+        layout = self.layout
+        _prop_split(layout)
+
+        _section_header(layout, "BAKE SHADER NODE", 'EXPORT')
+        box = layout.box()
+
+        row = box.row()
+        row.scale_y = 1.3
+        row.operator("baker.bake_selected_node", text="Bake Active Node", icon='EXPORT')
+
+        hint = box.row()
+        hint.scale_y = 0.65
+        hint.label(text="Select node in Shader Editor first", icon='INFO')
 
 
 class BAKER_PT_Cage(Panel):
@@ -2220,6 +2690,7 @@ classes = (
     BAKER_PT_Settings,
     BAKER_PT_Output,
     BAKER_PT_Queue,
+    BAKER_PT_NodeBake,
     BAKER_PT_Cage,
 )
 

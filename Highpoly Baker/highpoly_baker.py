@@ -1175,29 +1175,82 @@ def _setup_alpha_bake(high_objects, mode):
                 nodes = mat.node_tree.nodes
                 links = mat.node_tree.links
 
-                bsdf        = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
-                alpha_input = bsdf.inputs.get('Alpha') if bsdf else None
-                output      = next((n for n in nodes
-                                    if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
-                if not all([bsdf, alpha_input, output]):
+                output = next((n for n in nodes
+                                if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
+                if output is None:
                     continue
 
-                existing_links   = [(lnk.from_node, lnk.from_socket)
-                                    for lnk in links if lnk.to_socket == alpha_input]
-                existing_default = alpha_input.default_value
                 surface_in       = output.inputs['Surface']
                 saved_surf_links = [(lnk.from_node, lnk.from_socket)
                                     for lnk in links if lnk.to_socket == surface_in]
 
+                alpha_socket     = None    # outer socket carrying the alpha value
+                alpha_default    = 1.0
+                group_cleanup    = None
+
+                # Strategy 1: direct Principled BSDF
+                bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+                if bsdf:
+                    alpha_in = bsdf.inputs.get('Alpha')
+                    if alpha_in:
+                        alpha_default = alpha_in.default_value
+                        for lnk in links:
+                            if lnk.to_socket == alpha_in:
+                                alpha_socket = lnk.from_socket
+                                break
+
+                # Strategy 2: Group node — go inside
+                if alpha_socket is None and bsdf is None:
+                    group = next((n for n in nodes if n.type == 'GROUP'), None)
+                    if group and group.node_tree:
+                        inner_tree = group.node_tree
+                        inner_bsdf = next(
+                            (n for n in inner_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None
+                        )
+                        if inner_bsdf:
+                            inner_alpha = inner_bsdf.inputs.get('Alpha')
+                            if inner_alpha:
+                                alpha_default = inner_alpha.default_value
+
+                                # Trace connected source inside group
+                                inner_source = None
+                                for lnk in inner_tree.links:
+                                    if lnk.to_socket == inner_alpha:
+                                        inner_source = lnk.from_socket
+                                        break
+
+                                if inner_source:
+                                    temp_socket = inner_tree.interface.new_socket(
+                                        name="__bake_alpha__",
+                                        in_out='OUTPUT',
+                                        socket_type='NodeSocketFloat',
+                                    )
+                                    group_output = next(
+                                        (n for n in inner_tree.nodes if n.type == 'GROUP_OUTPUT'),
+                                        None
+                                    )
+                                    if group_output:
+                                        inner_tree.links.new(
+                                            inner_source,
+                                            group_output.inputs['__bake_alpha__']
+                                        )
+                                        alpha_socket = group.outputs.get('__bake_alpha__')
+                                        group_cleanup = {
+                                            'inner_tree':   inner_tree,
+                                            'temp_socket':  temp_socket,
+                                            'group_output': group_output,
+                                        }
+
+                # Build emission node
                 emit_node = nodes.new('ShaderNodeEmission')
                 emit_node.label    = '__alpha_bake__'
-                emit_node.location = (bsdf.location.x - 250, bsdf.location.y - 500)
+                emit_node.location = (output.location.x - 200, output.location.y - 200)
                 emit_node.inputs['Color'].default_value = (1, 1, 1, 1)
 
-                if existing_links:
-                    links.new(existing_links[0][1], emit_node.inputs['Strength'])
+                if alpha_socket:
+                    links.new(alpha_socket, emit_node.inputs['Strength'])
                 else:
-                    emit_node.inputs['Strength'].default_value = existing_default
+                    emit_node.inputs['Strength'].default_value = alpha_default
 
                 links.new(emit_node.outputs['Emission'], surface_in)
 
@@ -1207,6 +1260,7 @@ def _setup_alpha_bake(high_objects, mode):
                     'emit_node':        emit_node,
                     'surface_input':    surface_in,
                     'saved_surf_links': saved_surf_links,
+                    'group_cleanup':    group_cleanup,
                 })
 
     return restore_data
@@ -1237,6 +1291,19 @@ def _restore_alpha_bake(restore_data):
             for from_node, from_socket in rd['saved_surf_links']:
                 links.new(from_socket, surf_in)
             nodes.remove(emit_node)
+
+            # Remove temporary group output if we created one
+            gc = rd.get('group_cleanup')
+            if gc:
+                inner_tree   = gc['inner_tree']
+                group_output = gc['group_output']
+                temp_socket  = gc['temp_socket']
+                bake_input   = group_output.inputs.get('__bake_alpha__')
+                if bake_input:
+                    for lnk in list(inner_tree.links):
+                        if lnk.to_socket == bake_input:
+                            inner_tree.links.remove(lnk)
+                inner_tree.interface.remove(temp_socket)
 
     for mat in mats_to_remove:
         bpy.data.materials.remove(mat)

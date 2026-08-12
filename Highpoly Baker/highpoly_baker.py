@@ -558,7 +558,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         ao_tex.location = (TEX_X, row_y)
         ao_tex.width    = TEX_W
         ao_tex.image    = baked_images['AO']
-        ao_tex.image.colorspace_settings.name = 'Non-Color'
+        if ao_tex.image.colorspace_settings.name != 'Non-Color': ao_tex.image.colorspace_settings.name = 'Non-Color'
         ao_tex.label    = 'AO'
         row_y -= ROW_H
 
@@ -582,7 +582,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         tex.location = (TEX_X, row_y)
         tex.width    = TEX_W
         tex.image    = baked_images['METALNESS']
-        tex.image.colorspace_settings.name = 'Non-Color'
+        if tex.image.colorspace_settings.name != 'Non-Color': tex.image.colorspace_settings.name = 'Non-Color'
         tex.label    = 'Metalness'
         links.new(tex.outputs['Color'], bsdf.inputs['Metallic'])
         row_y -= ROW_H
@@ -593,7 +593,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         tex.location = (TEX_X, row_y)
         tex.width    = TEX_W
         tex.image    = baked_images['ROUGHNESS']
-        tex.image.colorspace_settings.name = 'Non-Color'
+        if tex.image.colorspace_settings.name != 'Non-Color': tex.image.colorspace_settings.name = 'Non-Color'
         tex.label    = 'Roughness'
         links.new(tex.outputs['Color'], bsdf.inputs['Roughness'])
         row_y -= ROW_H
@@ -604,7 +604,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         tex.location = (TEX_X, row_y)
         tex.width    = TEX_W
         tex.image    = baked_images['NORMAL']
-        tex.image.colorspace_settings.name = 'Non-Color'
+        if tex.image.colorspace_settings.name != 'Non-Color': tex.image.colorspace_settings.name = 'Non-Color'
         tex.label    = 'Normal Map'
         nm  = nodes.new('ShaderNodeNormalMap')
         nm.location  = (MID_X, row_y)
@@ -618,7 +618,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         tex.location = (TEX_X, row_y)
         tex.width    = TEX_W
         tex.image    = baked_images['ALPHA']
-        tex.image.colorspace_settings.name = 'Non-Color'
+        if tex.image.colorspace_settings.name != 'Non-Color': tex.image.colorspace_settings.name = 'Non-Color'
         tex.label    = 'Alpha'
         links.new(tex.outputs['Color'], bsdf.inputs['Alpha'])
         # Viewport alpha display

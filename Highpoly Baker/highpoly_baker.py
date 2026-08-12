@@ -630,6 +630,63 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
             mat.use_transparent_shadow = True
         row_y -= ROW_H
 
+    # ── ORM (packed channel texture) ─────────────────────────
+    if 'ORM' in baked_images:
+        row_y -= 40  # extra gap to separate from individual maps
+
+        orm_tex = nodes.new('ShaderNodeTexImage')
+        orm_tex.location = (TEX_X, row_y)
+        orm_tex.width    = TEX_W
+        orm_tex.image    = baked_images['ORM']
+        if orm_tex.image.colorspace_settings.name != 'Non-Color': orm_tex.image.colorspace_settings.name = 'Non-Color'
+        orm_tex.label    = 'ORM (packed)'
+        orm_tex.use_custom_color = True
+        orm_tex.color = (0.45, 0.30, 0.15)  # brown/amber to distinguish
+
+        sep = nodes.new('ShaderNodeSeparateColor')
+        sep.location = (MID_X, row_y)
+        sep.label    = 'Unpack ORM'
+        links.new(orm_tex.outputs['Color'], sep.inputs['Color'])
+
+        # R=AO → multiply with Base Color (same pattern as individual AO)
+        if diff_tex or 'DIFFUSE' in baked_images:
+            # Find the existing Base Color link to insert AO multiply
+            ao_mix = nodes.new('ShaderNodeMixRGB')
+            ao_mix.location   = (MID_X + 150, row_y + 60)
+            ao_mix.blend_type = 'MULTIPLY'
+            ao_mix.inputs['Fac'].default_value = 1.0
+            ao_mix.label = 'AO Multiply'
+
+            # Grab whatever is currently connected to Base Color
+            base_link = None
+            for lnk in list(links):
+                if lnk.to_socket == bsdf.inputs['Base Color']:
+                    base_link = lnk.from_socket
+                    links.remove(lnk)
+                    break
+
+            if base_link:
+                links.new(base_link, ao_mix.inputs['Color1'])
+            else:
+                ao_mix.inputs['Color1'].default_value = (0.8, 0.8, 0.8, 1.0)
+
+            links.new(sep.outputs['Red'], ao_mix.inputs['Color2'])
+            links.new(ao_mix.outputs['Color'], bsdf.inputs['Base Color'])
+
+        # G=Roughness → override individual Roughness connection
+        for lnk in list(links):
+            if lnk.to_socket == bsdf.inputs['Roughness']:
+                links.remove(lnk)
+        links.new(sep.outputs['Green'], bsdf.inputs['Roughness'])
+
+        # B=Metallic → override individual Metallic connection
+        for lnk in list(links):
+            if lnk.to_socket == bsdf.inputs['Metallic']:
+                links.remove(lnk)
+        links.new(sep.outputs['Blue'], bsdf.inputs['Metallic'])
+
+        row_y -= ROW_H
+
     _assign_baked_material(low_obj, mat, preserve_materials)
     return mat
 
@@ -1726,6 +1783,10 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
             if orm_path:
                 saved_paths.append(orm_path)
                 operator.report({'INFO'}, f"ORM packed: {orm_path}")
+                # Store ORM image so _build_baked_material can wire it
+                orm_img = bpy.data.images.get(orm_name)
+                if orm_img:
+                    baked_images_out['ORM'] = orm_img
 
     return saved_paths
 

@@ -22,6 +22,16 @@ Normal Convention — OpenGL (Y+) or DirectX (Y-). When set to DirectX, the gree
 
 Pack ORM — checkbox. After all passes complete, if any combination of AO, Roughness, or Metalness was baked, packs them into a single RGB image: R=AO, G=Roughness, B=Metallic. Saves as ObjectName_ORM.png/tga/exr alongside the individual maps. Missing channels default to white (1.0). The standard format for Unreal Engine and optimised PBR workflows that use a single ORM texture instead of three separate ones.
 
+How it works:
+
+ORM Image Texture — labeled "ORM (packed)" with a custom amber/brown color so it stands out from the individual map nodes above it
+Separate Color — splits the packed texture into R, G, B channels
+R (AO) — feeds into a Multiply node that's inserted between the existing Base Color source and the BSDF, same as the individual AO wiring
+G (Roughness) — replaces any existing Roughness connection on the BSDF
+B (Metallic) — replaces any existing Metallic connection on the BSDF
+
+The individual AO/Roughness/Metalness texture nodes are still created above (for reference and for non-ORM workflows), but the ORM's Separate Color connections override them on the BSDF inputs. This way you can toggle ORM on/off between bakes and either wiring works.
+
 v1.10.0 — new Bake Active Node feature. Here's how it works:
 
 Workflow:

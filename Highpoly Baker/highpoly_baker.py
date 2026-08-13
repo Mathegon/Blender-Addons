@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "GRILLEN v2.0.0",
+    "name": "GRILLEN v2.0.1",
     "author": "Claude",
-    "version": (2, 0, 0),
+    "version": (2, 0, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Grillen",
     "description": (
@@ -2512,7 +2512,7 @@ def _dirty_icon(is_clean):
 # ---------------------------------------------------------------------------
 
 class BAKER_PT_Main(Panel):
-    bl_label       = "Grillen v2.0.0"
+    bl_label       = "Grillen v2.0.1"
     bl_idname      = "BAKER_PT_main"
     bl_space_type  = _SPACE
     bl_region_type = _REGION
@@ -2560,6 +2560,18 @@ class BAKER_PT_Main(Panel):
         row = col.row(align=True)
         row.alert = s.low_poly is None
         row.prop(s, "low_poly", icon='MESH_GRID')
+
+        # Quick-add to bake queue
+        box.separator(factor=0.4)
+        q_row = box.row(align=True)
+        q_row.enabled = (
+            (s.high_poly is not None or len([i for i in s.high_poly_list if i.obj]) > 0)
+            and s.low_poly is not None
+        )
+        q_row.operator("baker.queue_add", text="Add to Queue", icon='APPEND_BLEND')
+        q_count = len(s.queue)
+        if q_count > 0:
+            q_row.label(text=f"({q_count})")
 
         layout.separator(factor=0.6)
 

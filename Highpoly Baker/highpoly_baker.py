@@ -1938,6 +1938,10 @@ class BAKER_OT_BakeQueue(Operator):
             self.report({'ERROR'}, "No enabled items in the bake queue.")
             return {'CANCELLED'}
 
+        if not (s.bake_normals or s.bake_ao or s.bake_diffuse or s.bake_roughness or s.bake_metalness or s.bake_alpha):
+            self.report({'ERROR'}, "Enable at least one bake pass.")
+            return {'CANCELLED'}
+
         view3d_area, _ = _get_view3d_context(context)
         if view3d_area is None:
             self.report({'ERROR'}, "No 3D Viewport found.")
@@ -1955,12 +1959,55 @@ class BAKER_OT_BakeQueue(Operator):
                 self.report({'WARNING'}, f"Queue item {idx+1}: missing high or low poly — skipped.")
                 continue
 
+            highs = [item.high_poly]
+            low   = item.low_poly
+
+            if low in highs:
+                self.report({'WARNING'}, f"Queue item {idx+1}: low-poly same as high-poly — skipped.")
+                continue
+
+            # Scale check
+            scale_ok = True
+            for obj in highs + [low]:
+                if not _check_and_handle_scale(obj, s.auto_apply_scale, context):
+                    self.report({'WARNING'},
+                        f"Queue item {idx+1}: '{obj.name}' has unapplied scale — skipped.")
+                    scale_ok = False
+                    break
+            if not scale_ok:
+                continue
+
+            # UV overlap check
+            has_ov, ov_count = _check_uv_overlaps(low)
+            if has_ov:
+                self.report({'WARNING'},
+                    f"Queue item {idx+1}: '{low.name}' has {ov_count}+ overlapping UV islands.")
+
             self.report({'INFO'}, f"Queue {idx+1}/{len(items)}: {item.high_poly.name} → {item.low_poly.name}")
-            prefix   = (item.prefix_override.strip() + "_") if item.prefix_override.strip() else (s.prefix.strip() + "_") if s.prefix.strip() else ""
+            prefix = (item.prefix_override.strip() + "_") if item.prefix_override.strip() else (s.prefix.strip() + "_") if s.prefix.strip() else ""
+
             baked_images = {}
+
+            # Pre-populate baked_images for skip_clean_maps
+            if s.skip_clean_maps:
+                low_name = low.name
+                skip_lookup = {
+                    'NORMAL':    ('normal_baked',    prefix + low_name + "_Normal"),
+                    'AO':        ('ao_baked',        prefix + low_name + "_AO"),
+                    'DIFFUSE':   ('diffuse_baked',   prefix + low_name + "_Diffuse"),
+                    'ROUGHNESS': ('roughness_baked', prefix + low_name + "_Roughness"),
+                    'METALNESS': ('metalness_baked', prefix + low_name + "_Metalness"),
+                    'ALPHA':     ('alpha_baked',     prefix + low_name + "_Alpha"),
+                }
+                for bake_type, (flag_attr, img_name) in skip_lookup.items():
+                    if getattr(s, flag_attr, False):
+                        existing_img = bpy.data.images.get(img_name)
+                        if existing_img:
+                            baked_images[bake_type] = existing_img
+
             try:
-                saved = _do_bake(self, context, [item.high_poly], item.low_poly, s, prefix, baked_images)
-                mat   = _build_baked_material(item.low_poly, baked_images, s.preserve_materials)
+                saved = _do_bake(self, context, highs, low, s, prefix, baked_images)
+                mat   = _build_baked_material(low, baked_images, s.preserve_materials)
                 self.report({'INFO'}, f"Queue {idx+1}: done — {len(saved)} map(s), material '{mat.name}'.")
                 success += 1
             except Exception as e:

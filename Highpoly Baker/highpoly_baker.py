@@ -3111,23 +3111,32 @@ class BAKER_OT_AtlasMerge(Operator):
 
         self.report({'INFO'}, f"Atlas: found maps: {', '.join(sorted(found_maps))}")
 
-        # ── 2. Duplicate and join ────────────────────────────────────────
+        # ── 2. Create evaluated copies and join ────────────────────────────
+        # Use evaluated meshes (modifiers applied cleanly) to avoid
+        # Cycles triangulation artifacts from non-planar quads.
+        depsgraph = context.evaluated_depsgraph_get()
         bpy.ops.object.select_all(action='DESELECT')
         dupes = []
         for obj in objects:
-            obj.select_set(True)
-            context.view_layer.objects.active = obj
-            bpy.ops.object.duplicate()
-            dupe = context.active_object
-            dupe.name = "__atlas_tmp__" + obj.name
+            obj_eval = obj.evaluated_get(depsgraph)
+            mesh = bpy.data.meshes.new_from_object(obj_eval)
+            dupe = bpy.data.objects.new("__atlas_tmp__" + obj.name, mesh)
+            dupe.matrix_world = obj.matrix_world.copy()
+            context.collection.objects.link(dupe)
+
+            # Copy materials so the bake can read existing textures
+            for src_slot in obj.material_slots:
+                if src_slot.material:
+                    dupe.data.materials.append(src_slot.material)
+
             dupes.append(dupe)
-            bpy.ops.object.select_all(action='DESELECT')
 
         # Select all dupes and join
         for d in dupes:
             d.select_set(True)
         context.view_layer.objects.active = dupes[0]
-        bpy.ops.object.join()
+        if len(dupes) > 1:
+            bpy.ops.object.join()
         joined = context.active_object
         joined.name = "__atlas_joined__"
 

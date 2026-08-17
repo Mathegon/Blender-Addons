@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "GRILLEN v2.0.1",
+    "name": "GRILLEN v2.1.0",
     "author": "Claude",
-    "version": (2, 0, 1),
+    "version": (2, 1, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Grillen",
     "description": (
@@ -64,6 +64,15 @@ class BAKER_PG_HighPolyItem(PropertyGroup):
         name="Object",
         type=bpy.types.Object,
         description="High-poly source mesh",
+        poll=lambda self, o: o.type == 'MESH',
+    )
+
+
+class BAKER_PG_AtlasItem(PropertyGroup):
+    obj: PointerProperty(
+        name="Object",
+        type=bpy.types.Object,
+        description="Mesh object to include in the atlas",
         poll=lambda self, o: o.type == 'MESH',
     )
 
@@ -352,6 +361,21 @@ class BAKER_PG_Settings(PropertyGroup):
     # ── Bake queue ──────────────────────────────────────────────────────────
     queue: CollectionProperty(type=BAKER_PG_QueueItem)
     queue_index: IntProperty(name="Active Queue Item", default=0)
+
+    # ── Atlas Merge ─────────────────────────────────────────────────────────
+    atlas_list: CollectionProperty(type=BAKER_PG_AtlasItem)
+    atlas_list_index: IntProperty(name="Active Atlas Item", default=0)
+
+    atlas_resolution: EnumProperty(
+        name="Atlas Resolution",
+        items=[
+            ('1024', "1024 px", ""),
+            ('2048', "2048 px", ""),
+            ('4096', "4096 px", ""),
+            ('8192', "8192 px", ""),
+        ],
+        default='2048',
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2629,7 +2653,7 @@ def _dirty_icon(is_clean):
 # ---------------------------------------------------------------------------
 
 class BAKER_PT_Main(Panel):
-    bl_label       = "Grillen v2.0.1"
+    bl_label       = "Grillen v2.1.0"
     bl_idname      = "BAKER_PT_main"
     bl_space_type  = _SPACE
     bl_region_type = _REGION
@@ -2940,6 +2964,417 @@ class BAKER_PT_NodeBake(Panel):
         hint.label(text="Select node in Shader Editor first", icon='INFO')
 
 
+# ---------------------------------------------------------------------------
+# Atlas Merge
+# ---------------------------------------------------------------------------
+
+class BAKER_UL_AtlasList(UIList):
+    bl_idname = "BAKER_UL_atlas_list"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_prop):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            if item.obj:
+                layout.prop(item, "obj", text="", emboss=False, icon='MESH_DATA')
+            else:
+                layout.label(text="(empty)", icon='ERROR')
+
+
+class BAKER_OT_AtlasAdd(Operator):
+    bl_idname  = "baker.atlas_add"
+    bl_label   = "Add to Atlas"
+    bl_description = "Add all selected mesh objects to the atlas merge list"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.baker_settings
+        candidates = [o for o in context.selected_objects if o.type == 'MESH']
+        if not candidates:
+            self.report({'WARNING'}, "Select at least one mesh object.")
+            return {'CANCELLED'}
+        existing = {item.obj for item in s.atlas_list}
+        added = 0
+        for obj in candidates:
+            if obj in existing:
+                continue
+            item = s.atlas_list.add()
+            item.obj  = obj
+            item.name = obj.name
+            added += 1
+        if added == 0:
+            self.report({'WARNING'}, "All selected objects are already in the list.")
+            return {'CANCELLED'}
+        s.atlas_list_index = len(s.atlas_list) - 1
+        self.report({'INFO'}, f"Added {added} object(s) to atlas.")
+        return {'FINISHED'}
+
+
+class BAKER_OT_AtlasRemove(Operator):
+    bl_idname  = "baker.atlas_remove"
+    bl_label   = "Remove from Atlas"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s   = context.scene.baker_settings
+        idx = s.atlas_list_index
+        if not s.atlas_list:
+            return {'CANCELLED'}
+        s.atlas_list.remove(idx)
+        s.atlas_list_index = max(0, idx - 1)
+        return {'FINISHED'}
+
+
+class BAKER_OT_AtlasClear(Operator):
+    bl_idname  = "baker.atlas_clear"
+    bl_label   = "Clear Atlas List"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        context.scene.baker_settings.atlas_list.clear()
+        return {'FINISHED'}
+
+
+class BAKER_OT_AtlasMerge(Operator):
+    bl_idname  = "baker.atlas_merge"
+    bl_label   = "Merge to Atlas"
+    bl_description = (
+        "Combine multiple baked objects into a single material with shared atlas textures. "
+        "Creates a new UV layout, re-bakes all maps, and assigns one material to all objects."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        import numpy as np
+
+        s       = context.scene.baker_settings
+        objects = [item.obj for item in s.atlas_list if item.obj is not None]
+
+        if len(objects) < 2:
+            self.report({'ERROR'}, "Add at least 2 objects to the atlas list.")
+            return {'CANCELLED'}
+
+        view3d_area, view3d_region = _get_view3d_context(context)
+        if view3d_area is None:
+            self.report({'ERROR'}, "No 3D Viewport found.")
+            return {'CANCELLED'}
+
+        atlas_res = int(s.atlas_resolution)
+
+        # ── 1. Detect which map types exist across all objects ────────────
+        MAP_LABELS = {
+            'Diffuse':   'DIFFUSE',
+            'AO':        'AO',
+            'Roughness': 'ROUGHNESS',
+            'Metalness': 'METALNESS',
+            'Normal Map':'NORMAL',
+            'Alpha':     'ALPHA',
+        }
+        found_maps = set()
+        for obj in objects:
+            if not obj.data.materials:
+                continue
+            mat = obj.data.materials[0]
+            if not mat or not mat.use_nodes:
+                continue
+            for node in mat.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and node.image:
+                    label = node.label or node.name
+                    for key, map_type in MAP_LABELS.items():
+                        if key.lower() in label.lower():
+                            found_maps.add(map_type)
+
+        if not found_maps:
+            self.report({'ERROR'}, "No baked textures found on the selected objects.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Atlas: found maps: {', '.join(sorted(found_maps))}")
+
+        # ── 2. Duplicate and join ────────────────────────────────────────
+        bpy.ops.object.select_all(action='DESELECT')
+        dupes = []
+        for obj in objects:
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+            bpy.ops.object.duplicate()
+            dupe = context.active_object
+            dupe.name = "__atlas_tmp__" + obj.name
+            dupes.append(dupe)
+            bpy.ops.object.select_all(action='DESELECT')
+
+        # Select all dupes and join
+        for d in dupes:
+            d.select_set(True)
+        context.view_layer.objects.active = dupes[0]
+        bpy.ops.object.join()
+        joined = context.active_object
+        joined.name = "__atlas_joined__"
+
+        # ── 3. Create atlas UV on the joined mesh ────────────────────────
+        atlas_uv_name = "Atlas_UV"
+        if atlas_uv_name not in joined.data.uv_layers:
+            joined.data.uv_layers.new(name=atlas_uv_name)
+        joined.data.uv_layers[atlas_uv_name].active = True
+        joined.data.uv_layers.active = joined.data.uv_layers[atlas_uv_name]
+
+        with context.temp_override(area=view3d_area, region=view3d_region):
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.uv.smart_project(
+                angle_limit=1.15192,
+                island_margin=0.01,
+                rotate_method='AXIS_ALIGNED_Y',
+            )
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # ── 4. Bake each map type from existing materials → atlas UV ─────
+        orig_engine = context.scene.render.engine
+        context.scene.render.engine = 'CYCLES'
+
+        # Ensure GPU
+        prefs = bpy.context.preferences.addons.get('cycles')
+        if prefs and prefs.preferences.has_active_device():
+            context.scene.cycles.device = 'GPU'
+
+        atlas_images = {}
+        prefix = "Atlas_"
+
+        for map_type in sorted(found_maps):
+            self.report({'INFO'}, f"Atlas: baking {map_type}…")
+            is_data = map_type != 'DIFFUSE'
+            img_name = prefix + map_type.capitalize()
+            img = _make_image(img_name, atlas_res, is_data=is_data, overwrite=True)
+
+            # Set as bake target on the joined mesh
+            _set_active_image_node(joined, img)
+
+            bpy.ops.object.select_all(action='DESELECT')
+            joined.select_set(True)
+            context.view_layer.objects.active = joined
+
+            if map_type == 'NORMAL':
+                # Self-bake NORMAL type recalculates tangent-space normals
+                # for the new UV layout
+                with context.temp_override(area=view3d_area, region=view3d_region):
+                    bpy.ops.object.bake(
+                        type='NORMAL',
+                        use_selected_to_active=False,
+                        width=atlas_res, height=atlas_res,
+                        margin=s.margin,
+                        margin_type='EXTEND',
+                        use_clear=True,
+                        target='IMAGE_TEXTURES',
+                    )
+            else:
+                # For color/data maps: the existing materials already have
+                # Image Textures on the original UVs. A self-bake with EMIT
+                # reads from the old UV and writes to the atlas UV.
+                #
+                # Temporarily wire the appropriate texture → Emission → Output
+                # for each material slot on the joined mesh.
+                mat_restores = []
+                for slot in joined.material_slots:
+                    mat = slot.material
+                    if not mat or not mat.use_nodes:
+                        continue
+                    nodes = mat.node_tree.nodes
+                    links = mat.node_tree.links
+
+                    # Find the texture node for this map type
+                    source_node = None
+                    for node in nodes:
+                        if node.type == 'TEX_IMAGE' and node.image:
+                            label = (node.label or node.name).lower()
+                            for key, mt in MAP_LABELS.items():
+                                if mt == map_type and key.lower() in label:
+                                    source_node = node
+                                    break
+                        if source_node:
+                            break
+
+                    if source_node is None:
+                        continue
+
+                    output = next(
+                        (n for n in nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output),
+                        None
+                    )
+                    if output is None:
+                        continue
+
+                    surface_in   = output.inputs['Surface']
+                    saved_links  = [(l.from_node, l.from_socket)
+                                    for l in links if l.to_socket == surface_in]
+
+                    emit = nodes.new('ShaderNodeEmission')
+                    emit.label    = '__atlas_bake__'
+                    emit.location = (output.location.x - 200, output.location.y - 200)
+
+                    if source_node.outputs[0].type == 'RGBA':
+                        links.new(source_node.outputs['Color'], emit.inputs['Color'])
+                        emit.inputs['Strength'].default_value = 1.0
+                    else:
+                        links.new(source_node.outputs[0], emit.inputs['Strength'])
+                        emit.inputs['Color'].default_value = (1, 1, 1, 1)
+
+                    links.new(emit.outputs['Emission'], surface_in)
+
+                    mat_restores.append({
+                        'mat':         mat,
+                        'emit':        emit,
+                        'surface_in':  surface_in,
+                        'saved_links': saved_links,
+                    })
+
+                try:
+                    with context.temp_override(area=view3d_area, region=view3d_region):
+                        bpy.ops.object.bake(
+                            type='EMIT',
+                            use_selected_to_active=False,
+                            width=atlas_res, height=atlas_res,
+                            margin=s.margin,
+                            margin_type=s.margin_type,
+                            use_clear=True,
+                            target='IMAGE_TEXTURES',
+                        )
+                finally:
+                    for rd in mat_restores:
+                        mat   = rd['mat']
+                        links = mat.node_tree.links
+                        nodes = mat.node_tree.nodes
+                        for lnk in list(links):
+                            if lnk.to_socket == rd['surface_in'] and lnk.from_node == rd['emit']:
+                                links.remove(lnk)
+                        for fn, fs in rd['saved_links']:
+                            links.new(fs, rd['surface_in'])
+                        nodes.remove(rd['emit'])
+
+            # Save atlas image
+            _save_image(img, s.output_dir, img_name,
+                        fmt=s.output_format, depth=s.output_depth)
+            atlas_images[map_type] = img
+            self.report({'INFO'}, f"Atlas: {map_type} done.")
+
+        context.scene.render.engine = orig_engine
+
+        # ── 5. Build shared atlas material ───────────────────────────────
+        atlas_mat = _build_baked_material(joined, atlas_images, False)
+        atlas_mat.name = "Atlas_Material"
+
+        # ── 6. Transfer atlas UV and material to original objects ─────────
+        import bmesh
+
+        # Get the atlas UV data from the joined mesh before we delete it
+        joined_mesh = joined.data
+        atlas_uv_layer = joined_mesh.uv_layers.get(atlas_uv_name)
+
+        # Track which vertex range belongs to which original object
+        vert_offset = 0
+        for obj in objects:
+            obj_vert_count = len(obj.data.vertices)
+            obj_face_count = len(obj.data.polygons)
+
+            # Add atlas UV layer to the original object
+            if atlas_uv_name not in obj.data.uv_layers:
+                obj.data.uv_layers.new(name=atlas_uv_name)
+
+            # Copy UV coordinates from joined mesh to original
+            orig_uv = obj.data.uv_layers[atlas_uv_name]
+
+            # Map loops: the joined mesh has loops in the same order as the
+            # concatenated original objects
+            loop_offset = 0
+            for i_obj2 in range(objects.index(obj)):
+                loop_offset += len(objects[i_obj2].data.loops)
+
+            for i, loop in enumerate(obj.data.loops):
+                joined_loop_idx = loop_offset + i
+                if joined_loop_idx < len(joined_mesh.loops):
+                    src_uv = atlas_uv_layer.data[joined_loop_idx].uv
+                    orig_uv.data[i].uv = src_uv
+
+            # Set atlas UV as active
+            obj.data.uv_layers.active = orig_uv
+
+            # Assign the atlas material
+            if obj.data.materials:
+                obj.data.materials[0] = atlas_mat
+            else:
+                obj.data.materials.append(atlas_mat)
+
+        # ── 7. Cleanup ───────────────────────────────────────────────────
+        bpy.data.objects.remove(joined, do_unlink=True)
+
+        # Remove __bake_target__ nodes from atlas material
+        if atlas_mat.use_nodes:
+            for node in list(atlas_mat.node_tree.nodes):
+                if node.label == '__bake_target__':
+                    atlas_mat.node_tree.nodes.remove(node)
+
+        if s.post_bake_preview:
+            _set_material_preview(context)
+
+        self.report({'INFO'},
+            f"Atlas merge complete: {len(objects)} objects → 1 material, "
+            f"{len(atlas_images)} map(s) at {atlas_res}px."
+        )
+        return {'FINISHED'}
+
+
+class BAKER_PT_Atlas(Panel):
+    bl_label       = "Atlas Merge"
+    bl_idname      = "BAKER_PT_atlas"
+    bl_space_type  = _SPACE
+    bl_region_type = _REGION
+    bl_category    = _CAT
+    bl_parent_id   = "BAKER_PT_main"
+    bl_options     = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        self.layout.label(text="", icon='UV')
+
+    def draw(self, context):
+        layout = self.layout
+        s      = context.scene.baker_settings
+        _prop_split(layout)
+
+        _section_header(layout, "OBJECTS TO MERGE", 'OUTLINER_OB_MESH')
+        box = layout.box()
+
+        list_row = box.row()
+        list_row.template_list(
+            "BAKER_UL_atlas_list", "",
+            s, "atlas_list",
+            s, "atlas_list_index",
+            rows=3,
+        )
+        btn_col = list_row.column(align=True)
+        btn_col.operator("baker.atlas_add",    text="", icon='ADD')
+        btn_col.operator("baker.atlas_remove", text="", icon='REMOVE')
+        btn_col.separator()
+        btn_col.operator("baker.atlas_clear",  text="", icon='TRASH')
+
+        hint = box.row()
+        hint.scale_y = 0.7
+        hint.label(text="Add = all selected mesh objects", icon='INFO')
+
+        layout.separator(factor=0.6)
+
+        _section_header(layout, "ATLAS SETTINGS", 'IMAGE_DATA')
+        box = layout.box()
+        _prop_split(box)
+        box.prop(s, "atlas_resolution")
+
+        layout.separator(factor=0.6)
+
+        obj_count = len([i for i in s.atlas_list if i.obj])
+        row = layout.row()
+        row.enabled = obj_count >= 2
+        row.scale_y = 1.5
+        row.operator("baker.atlas_merge",
+            text=f"Merge {obj_count} Objects to Atlas",
+            icon='UV',
+        )
+
+
 class BAKER_PT_Cage(Panel):
     bl_label       = "Cage Generator"
     bl_idname      = "BAKER_PT_cage"
@@ -3015,10 +3450,12 @@ class BAKER_PT_Cage(Panel):
 
 classes = (
     BAKER_PG_HighPolyItem,
+    BAKER_PG_AtlasItem,
     BAKER_PG_QueueItem,
     BAKER_PG_Settings,
     BAKER_UL_HighPolyList,
     BAKER_UL_QueueList,
+    BAKER_UL_AtlasList,
     BAKER_OT_HighPolyAdd,
     BAKER_OT_HighPolyRemove,
     BAKER_OT_HighPolyClear,
@@ -3030,11 +3467,16 @@ classes = (
     BAKER_OT_BakeSelectedNode,
     BAKER_OT_AutoCageOffset,
     BAKER_OT_GenerateCage,
+    BAKER_OT_AtlasAdd,
+    BAKER_OT_AtlasRemove,
+    BAKER_OT_AtlasClear,
+    BAKER_OT_AtlasMerge,
     BAKER_PT_Main,
     BAKER_PT_Settings,
     BAKER_PT_Output,
     BAKER_PT_Queue,
     BAKER_PT_NodeBake,
+    BAKER_PT_Atlas,
     BAKER_PT_Cage,
 )
 

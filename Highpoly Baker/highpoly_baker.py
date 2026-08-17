@@ -787,10 +787,18 @@ def _set_material_preview(context):
 _TEMP_PREFIX = "__grillen_tmp__"
 
 
-def _purge_temps():
-    """Remove all leftover temp cage target objects from previous runs."""
-    for obj in [o for o in bpy.data.objects if o.name.startswith(_TEMP_PREFIX)]:
-        bpy.data.objects.remove(obj, do_unlink=True)
+def _purge_temps(cage_name=None):
+    """Remove leftover temp cage target objects.
+    If cage_name is given, only remove the temp for that specific cage.
+    Otherwise remove all temps (for backward compatibility).
+    """
+    if cage_name:
+        target_name = _TEMP_PREFIX + cage_name
+        for obj in [o for o in bpy.data.objects if o.name.startswith(target_name)]:
+            bpy.data.objects.remove(obj, do_unlink=True)
+    else:
+        for obj in [o for o in bpy.data.objects if o.name.startswith(_TEMP_PREFIX)]:
+            bpy.data.objects.remove(obj, do_unlink=True)
 
 
 def _auto_ray_distances(context, high_objects, low_obj, max_samples=500):
@@ -2449,7 +2457,7 @@ class BAKER_OT_GenerateCage(Operator):
             sources   = [s.high_poly]
             cage_name = s.high_poly.name + "_Cage"
 
-        _purge_temps()
+        _purge_temps(cage_name)
 
         temp = None
         try:
@@ -2462,7 +2470,7 @@ class BAKER_OT_GenerateCage(Operator):
             if len(dupes) > 1:
                 bpy.ops.object.join()
             temp      = context.active_object
-            temp.name = _TEMP_PREFIX
+            temp.name = _TEMP_PREFIX + cage_name
 
             mw      = temp.matrix_world
             corners = [mw @ mathutils.Vector(c) for c in temp.bound_box]

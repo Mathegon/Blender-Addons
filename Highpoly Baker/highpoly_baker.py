@@ -1507,6 +1507,16 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
     low_name = low.name
     _ensure_uv(low)
 
+    # Ensure Cycles uses GPU if available
+    prefs = bpy.context.preferences.addons.get('cycles')
+    if prefs:
+        cp = prefs.preferences
+        if cp.has_active_device():
+            cp.get_devices()
+            if context.scene.cycles.device != 'GPU':
+                context.scene.cycles.device = 'GPU'
+                operator.report({'INFO'}, "Switched Cycles to GPU compute.")
+
     # Temporarily unhide source objects — hidden objects can't be selected
     # for baking, which silently produces a black result.
     hidden_objects = []
@@ -2561,6 +2571,9 @@ class BAKER_OT_GenerateCage(Operator):
                     rotate_method='AXIS_ALIGNED_Y',
                 )
                 bpy.ops.object.mode_set(mode='OBJECT')
+
+            # Shade smooth for clean normal map baking
+            bpy.ops.object.shade_smooth()
 
             sw             = cage_obj.modifiers.new(name="Shrinkwrap", type='SHRINKWRAP')
             sw.target      = temp

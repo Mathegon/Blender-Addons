@@ -2105,22 +2105,33 @@ class BAKER_OT_BakeQueue(Operator):
 
             baked_images = {}
 
-            # Pre-populate baked_images for skip_clean_maps
+            # Per-object skip logic: check whether THIS object already has
+            # each baked image on disk, rather than using the global dirty flags
+            # (which are shared across all queue items and get set True after
+            # the first item bakes, causing subsequent items to skip).
             if s.skip_clean_maps:
                 low_name = low.name
                 skip_lookup = {
-                    'NORMAL':    ('normal_baked',    prefix + low_name + "_Normal"),
-                    'AO':        ('ao_baked',        prefix + low_name + "_AO"),
-                    'DIFFUSE':   ('diffuse_baked',   prefix + low_name + "_Diffuse"),
-                    'ROUGHNESS': ('roughness_baked', prefix + low_name + "_Roughness"),
-                    'METALNESS': ('metalness_baked', prefix + low_name + "_Metalness"),
-                    'ALPHA':     ('alpha_baked',     prefix + low_name + "_Alpha"),
+                    'NORMAL':    prefix + low_name + "_Normal",
+                    'AO':        prefix + low_name + "_AO",
+                    'DIFFUSE':   prefix + low_name + "_Diffuse",
+                    'ROUGHNESS': prefix + low_name + "_Roughness",
+                    'METALNESS': prefix + low_name + "_Metalness",
+                    'ALPHA':     prefix + low_name + "_Alpha",
                 }
-                for bake_type, (flag_attr, img_name) in skip_lookup.items():
-                    if getattr(s, flag_attr, False):
-                        existing_img = bpy.data.images.get(img_name)
-                        if existing_img:
-                            baked_images[bake_type] = existing_img
+                for bake_type, img_name in skip_lookup.items():
+                    existing_img = bpy.data.images.get(img_name)
+                    if existing_img:
+                        baked_images[bake_type] = existing_img
+
+            # Reset global dirty flags for each queue item so _do_bake
+            # evaluates freshly for this object
+            s.normal_baked    = False
+            s.ao_baked        = False
+            s.diffuse_baked   = False
+            s.roughness_baked = False
+            s.metalness_baked = False
+            s.alpha_baked     = False
 
             try:
                 saved = _do_bake(self, context, highs, low, s, prefix, baked_images)

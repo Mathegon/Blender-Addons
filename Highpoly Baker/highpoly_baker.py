@@ -1574,6 +1574,9 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
         if obj.hide_get():
             hidden_objects.append(obj)
             obj.hide_set(False)
+    if hidden_objects:
+        names = ", ".join(o.name for o in hidden_objects)
+        operator.report({'WARNING'}, f"Auto-unhid for bake: {names}")
 
     cage_obj = None
     if not s.multi_source and s.use_generated_cage:
@@ -2379,6 +2382,12 @@ class BAKER_OT_BakeSelectedNode(Operator):
         orig_engine = context.scene.render.engine
         context.scene.render.engine = 'CYCLES'
 
+        # Unhide if hidden
+        was_hidden = obj.hide_get()
+        if was_hidden:
+            obj.hide_set(False)
+            self.report({'WARNING'}, f"Auto-unhid '{obj.name}' for node bake.")
+
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
         context.view_layer.objects.active = obj
@@ -2405,6 +2414,10 @@ class BAKER_OT_BakeSelectedNode(Operator):
 
         finally:
             context.scene.render.engine = orig_engine
+
+            # Re-hide if we unhid it
+            if was_hidden:
+                obj.hide_set(True)
 
             # Restore material
             for lnk in list(links):

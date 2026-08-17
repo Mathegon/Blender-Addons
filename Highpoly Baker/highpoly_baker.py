@@ -1447,6 +1447,47 @@ def _downsample_2x(img_hi, target_name, renormalize=False):
     return out
 
 
+def _smooth_normals_across_seams(obj):
+    """
+    Temporarily set custom split normals from vertex normals (fully smooth,
+    ignoring UV seam splits). This prevents tangent-space discontinuities
+    at UV seams that cause ridge artifacts in normal map bakes.
+    Returns restore data or None.
+    """
+    mesh = obj.data
+
+    # Evaluate to get the deformed mesh (shrinkwrap etc.)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    obj_eval  = obj.evaluated_get(depsgraph)
+
+    # Get smooth vertex normals from the evaluated mesh
+    vert_normals = [v.normal.copy() for v in obj_eval.data.vertices]
+
+    # Store whether custom normals were already set
+    had_custom = mesh.has_custom_normals
+
+    # Build per-loop normals from vertex normals (smooth across all edges)
+    loop_normals = [vert_normals[loop.vertex_index] for loop in mesh.loops]
+
+    # Apply custom split normals
+    mesh.normals_split_custom_set(loop_normals)
+
+    return {'mesh': mesh, 'had_custom': had_custom}
+
+
+def _restore_normals(restore_data):
+    """Remove the temporary custom split normals."""
+    if restore_data is None:
+        return
+    mesh = restore_data['mesh']
+    if not restore_data['had_custom']:
+        # Clear custom normals if they weren't there before
+        if hasattr(mesh, 'free_normals_split'):
+            mesh.free_normals_split()
+        # Clear custom normals by toggling auto smooth
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+
 # ---------------------------------------------------------------------------
 # Core bake logic (shared by single bake and queue)
 # ---------------------------------------------------------------------------
@@ -1564,11 +1605,16 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
             metalness_restore    = None
             alpha_restore        = None
             diffuse_restore      = None
+            normals_restore      = None
             actual_bake_type     = bake_type
             alpha_extrusion      = cage_extrusion
             alpha_max_ray_dist   = max_ray_distance
 
-            if bake_type == 'DIFFUSE':
+            if bake_type == 'NORMAL':
+                # Smooth normals across UV seams to prevent tangent-space
+                # ridge artifacts at seam boundaries
+                normals_restore = _smooth_normals_across_seams(low)
+            elif bake_type == 'DIFFUSE':
                 diffuse_restore  = _setup_diffuse_bake(highs)
                 actual_bake_type = 'EMIT'
             elif bake_type == 'METALNESS':
@@ -1695,10 +1741,11 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
                 use_selected_to_active=True,
                 max_ray_distance=(alpha_max_ray_dist if bake_type == 'ALPHA' and s.alpha_mode in ('GEOMETRY',) else max_ray_distance),
                 width=bake_res, height=bake_res,
-                # Alpha: no margin — bleeding white into black gaps widens
-                # cutout edges beyond the actual high-poly geometry boundary
+                # Alpha: no margin — bleeding widens cutout edges.
+                # Normal: EXTEND margin — ADJACENT_FACES averages normals across
+                # UV seams which blurs sharp creases into soft gradients.
                 margin=0 if bake_type == 'ALPHA' else s.margin,
-                margin_type=s.margin_type,
+                margin_type='EXTEND' if bake_type == 'NORMAL' else s.margin_type,
                 use_clear=True,
                 target='IMAGE_TEXTURES',
             )
@@ -1718,6 +1765,8 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
                     with context.temp_override(area=view3d_area, region=view3d_region):
                         bpy.ops.object.bake(**bake_kwargs)
                 finally:
+                    if normals_restore is not None:
+                        _restore_normals(normals_restore)
                     if diffuse_restore is not None:
                         _restore_diffuse_bake(diffuse_restore)
                     if metalness_restore is not None:

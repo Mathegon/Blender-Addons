@@ -2082,8 +2082,22 @@ class BAKER_OT_BakeQueue(Operator):
             highs = [item.high_poly]
             low   = item.low_poly
 
+            # Unhide objects FIRST — hidden objects can't be selected,
+            # which breaks scale check, bake, and everything else.
+            queue_hidden = []
+            for obj in highs + [low]:
+                if obj.hide_get():
+                    queue_hidden.append(obj)
+                    obj.hide_set(False)
+            if queue_hidden:
+                names = ", ".join(o.name for o in queue_hidden)
+                self.report({'WARNING'}, f"Queue item {idx+1}: auto-unhid: {names}")
+
             if low in highs:
                 self.report({'WARNING'}, f"Queue item {idx+1}: low-poly same as high-poly — skipped.")
+                # Re-hide before continuing
+                for obj in queue_hidden:
+                    obj.hide_set(True)
                 continue
 
             # Scale check
@@ -2095,6 +2109,8 @@ class BAKER_OT_BakeQueue(Operator):
                     scale_ok = False
                     break
             if not scale_ok:
+                for obj in queue_hidden:
+                    obj.hide_set(True)
                 continue
 
             # UV overlap check
@@ -2143,6 +2159,10 @@ class BAKER_OT_BakeQueue(Operator):
                 success += 1
             except Exception as e:
                 self.report({'ERROR'}, f"Queue {idx+1} failed: {e}")
+            finally:
+                # Re-hide any objects we unhid for this queue item
+                for obj in queue_hidden:
+                    obj.hide_set(True)
 
         context.scene.render.engine = orig_engine
         bpy.ops.object.select_all(action='DESELECT')

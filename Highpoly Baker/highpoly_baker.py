@@ -536,7 +536,7 @@ def _assign_baked_material(low_obj, mat, preserve_materials):
             low_obj.data.materials.append(mat)
 
 
-def _build_baked_material(low_obj, baked_images, preserve_materials):
+def _build_baked_material(low_obj, baked_images, preserve_materials, uv_layer_name=""):
     mat_name = low_obj.name + "_Baked"
     mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(mat_name)
     mat.use_nodes = True
@@ -546,6 +546,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
 
     # ── Layout grid ──────────────────────────────────────────
     # Column positions (X):
+    UV_X    = -900     # UV Map node
     TEX_X   = -600     # texture image nodes
     MID_X   = -200     # processing nodes (Normal Map, AO Mix)
     BSDF_X  =  200     # Principled BSDF
@@ -565,6 +566,19 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
     bsdf.location = (BSDF_X, 0)
     links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
 
+    # ── Optional UV Map node (for atlas or specific UV layer) ─
+    uv_node = None
+    if uv_layer_name:
+        uv_node = nodes.new('ShaderNodeUVMap')
+        uv_node.location = (UV_X, 0)
+        uv_node.uv_map   = uv_layer_name
+        uv_node.label    = uv_layer_name
+
+    # Helper: wire UV Map node to a texture node if specified
+    def _wire_uv(tex_node):
+        if uv_node and tex_node:
+            links.new(uv_node.outputs['UV'], tex_node.inputs['Vector'])
+
     # ── Diffuse / Base Color ─────────────────────────────────
     diff_tex = None
     if 'DIFFUSE' in baked_images:
@@ -573,6 +587,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         diff_tex.width    = TEX_W
         diff_tex.image    = baked_images['DIFFUSE']
         diff_tex.label    = 'Diffuse'
+        _wire_uv(diff_tex)
         row_y -= ROW_H
 
     # ── AO ───────────────────────────────────────────────────
@@ -584,6 +599,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         ao_tex.image    = baked_images['AO']
         if ao_tex.image.colorspace_settings.name != 'Non-Color': ao_tex.image.colorspace_settings.name = 'Non-Color'
         ao_tex.label    = 'AO'
+        _wire_uv(ao_tex)
         row_y -= ROW_H
 
     # Wire Base Color: Diffuse * AO, or Diffuse alone, or AO alone
@@ -609,6 +625,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         if tex.image.colorspace_settings.name != 'Non-Color': tex.image.colorspace_settings.name = 'Non-Color'
         tex.label    = 'Metalness'
         links.new(tex.outputs['Color'], bsdf.inputs['Metallic'])
+        _wire_uv(tex)
         row_y -= ROW_H
 
     # ── Roughness ────────────────────────────────────────────
@@ -620,6 +637,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         if tex.image.colorspace_settings.name != 'Non-Color': tex.image.colorspace_settings.name = 'Non-Color'
         tex.label    = 'Roughness'
         links.new(tex.outputs['Color'], bsdf.inputs['Roughness'])
+        _wire_uv(tex)
         row_y -= ROW_H
 
     # ── Normal Map ───────────────────────────────────────────
@@ -632,8 +650,11 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         tex.label    = 'Normal Map'
         nm  = nodes.new('ShaderNodeNormalMap')
         nm.location  = (MID_X, row_y)
+        if uv_layer_name:
+            nm.uv_map = uv_layer_name
         links.new(tex.outputs['Color'], nm.inputs['Color'])
         links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
+        _wire_uv(tex)
         row_y -= ROW_H
 
     # ── Alpha ────────────────────────────────────────────────
@@ -645,6 +666,7 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         if tex.image.colorspace_settings.name != 'Non-Color': tex.image.colorspace_settings.name = 'Non-Color'
         tex.label    = 'Alpha'
         links.new(tex.outputs['Color'], bsdf.inputs['Alpha'])
+        _wire_uv(tex)
         # Viewport alpha display
         mat.blend_method         = 'HASHED'
         mat.use_backface_culling = False
@@ -665,7 +687,8 @@ def _build_baked_material(low_obj, baked_images, preserve_materials):
         if orm_tex.image.colorspace_settings.name != 'Non-Color': orm_tex.image.colorspace_settings.name = 'Non-Color'
         orm_tex.label    = 'ORM (packed)'
         orm_tex.use_custom_color = True
-        orm_tex.color = (0.45, 0.30, 0.15)  # brown/amber to distinguish
+        orm_tex.color = (0.45, 0.30, 0.15)
+        _wire_uv(orm_tex)  # brown/amber to distinguish
 
         sep = nodes.new('ShaderNodeSeparateColor')
         sep.location = (MID_X, row_y)
@@ -3256,7 +3279,7 @@ class BAKER_OT_AtlasMerge(Operator):
         context.scene.render.engine = orig_engine
 
         # ── 5. Build shared atlas material ───────────────────────────────
-        atlas_mat = _build_baked_material(joined, atlas_images, False)
+        atlas_mat = _build_baked_material(joined, atlas_images, False, uv_layer_name=atlas_uv_name)
         atlas_mat.name = "Atlas_Material"
 
         # ── 6. Transfer atlas UV and material to original objects ─────────

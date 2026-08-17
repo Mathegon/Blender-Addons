@@ -11,6 +11,34 @@ Process a queue of high/low-poly pairs.
 Improve normal/alpha maps with 2× supersampling; normal vectors are correctly re-normalized after downsampling.
 
 
+GRILLEN v2.1.0 — new Atlas Merge sub-panel! Here's the full feature:
+
+Panel UI
+
+A new collapsible ▸ Atlas Merge section with:
+
+Object list — add/remove mesh objects (same + / - / 🗑 pattern as everywhere else)
+Atlas Resolution dropdown — 1024 / 2048 / 4096 / 8192
+"Merge N Objects to Atlas" button — greyed out until 2+ objects are added
+How it works step by step:
+
+1. Detect maps — scans all objects' materials for baked texture nodes (by label: Diffuse, AO, Roughness, Metalness, Normal Map, Alpha) and builds a list of which map types to atlas.
+
+2. Duplicate & join — creates temporary copies of all objects and joins them into one mesh. Originals are untouched.
+
+3. Atlas UV — creates a new Atlas_UV layer on the joined mesh and runs Smart Project to distribute all objects' faces evenly across one UV space.
+
+4. Re-bake each map — for each detected map type:
+
+Normal maps: self-bake with type='NORMAL' — this correctly re-encodes the tangent-space normals for the new UV layout
+All other maps (Diffuse, AO, Roughness, Metalness, Alpha): temporarily wires each material's existing texture node → Emission → Output, bakes EMIT. The existing textures read from the old UVs, the bake writes to the new atlas UV. Connections are restored in finally blocks.
+
+5. Build shared material — creates Atlas_Material with all the atlas textures wired into a Principled BSDF using the same clean grid layout.
+
+6. Transfer back — copies the Atlas_UV coordinates from the joined mesh back to each original object, sets it as the active UV layer, and assigns Atlas_Material to all objects.
+
+7. Cleanup — deletes the temporary joined mesh, removes bake target nodes.
+
 
 v2.0.0 — four new export controls in the Output sub-panel:
 

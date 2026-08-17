@@ -75,6 +75,9 @@ class BAKER_PG_AtlasItem(PropertyGroup):
         description="Mesh object to include in the atlas",
         poll=lambda self, o: o.type == 'MESH',
     )
+    # Stored during atlas merge for restore
+    orig_material: StringProperty(name="Original Material", default="")
+    orig_uv_layer: StringProperty(name="Original UV Layer", default="")
 
 
 class BAKER_PG_QueueItem(PropertyGroup):
@@ -3300,16 +3303,23 @@ class BAKER_OT_AtlasMerge(Operator):
 
         # Track which vertex range belongs to which original object
         vert_offset = 0
-        for obj in objects:
+        for idx_obj, obj in enumerate(objects):
             obj_vert_count = len(obj.data.vertices)
             obj_face_count = len(obj.data.polygons)
+
+            # Store original material and UV for restore
+            atlas_item = s.atlas_list[idx_obj]
+            if obj.data.materials and obj.data.materials[0]:
+                atlas_item.orig_material = obj.data.materials[0].name
+            if obj.data.uv_layers.active:
+                atlas_item.orig_uv_layer = obj.data.uv_layers.active.name
 
             # Add atlas UV layer to the original object
             if atlas_uv_name not in obj.data.uv_layers:
                 obj.data.uv_layers.new(name=atlas_uv_name)
 
             # Copy UV coordinates from joined mesh to original
-            orig_uv = obj.data.uv_layers[atlas_uv_name]
+            atlas_uv = obj.data.uv_layers[atlas_uv_name]
 
             # Map loops: the joined mesh has loops in the same order as the
             # concatenated original objects
@@ -3321,10 +3331,10 @@ class BAKER_OT_AtlasMerge(Operator):
                 joined_loop_idx = loop_offset + i
                 if joined_loop_idx < len(joined_mesh.loops):
                     src_uv = atlas_uv_layer.data[joined_loop_idx].uv
-                    orig_uv.data[i].uv = src_uv
+                    atlas_uv.data[i].uv = src_uv
 
             # Set atlas UV as active
-            obj.data.uv_layers.active = orig_uv
+            obj.data.uv_layers.active = atlas_uv
 
             # Assign the atlas material
             if obj.data.materials:
@@ -3348,6 +3358,49 @@ class BAKER_OT_AtlasMerge(Operator):
             f"Atlas merge complete: {len(objects)} objects → 1 material, "
             f"{len(atlas_images)} map(s) at {atlas_res}px."
         )
+        return {'FINISHED'}
+
+
+class BAKER_OT_AtlasRestore(Operator):
+    bl_idname  = "baker.atlas_restore"
+    bl_label   = "Restore Originals"
+    bl_description = (
+        "Restore the original materials and UV layers on all atlas objects. "
+        "Use this to go back, fix individual bakes, then re-merge."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.baker_settings
+        restored = 0
+
+        for item in s.atlas_list:
+            obj = item.obj
+            if obj is None:
+                continue
+
+            # Restore original material
+            if item.orig_material:
+                orig_mat = bpy.data.materials.get(item.orig_material)
+                if orig_mat:
+                    if obj.data.materials:
+                        obj.data.materials[0] = orig_mat
+                    else:
+                        obj.data.materials.append(orig_mat)
+
+            # Restore original active UV layer
+            if item.orig_uv_layer:
+                uv = obj.data.uv_layers.get(item.orig_uv_layer)
+                if uv:
+                    obj.data.uv_layers.active = uv
+
+            restored += 1
+
+        if restored == 0:
+            self.report({'WARNING'}, "Nothing to restore — run Atlas Merge first.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Restored original materials on {restored} object(s). Fix your bakes, then re-merge.")
         return {'FINISHED'}
 
 
@@ -3405,6 +3458,16 @@ class BAKER_PT_Atlas(Panel):
             text=f"Merge {obj_count} Objects to Atlas",
             icon='UV',
         )
+
+        # Restore button — only show if originals were stored
+        has_originals = any(item.orig_material for item in s.atlas_list)
+        if has_originals:
+            layout.separator(factor=0.4)
+            row2 = layout.row()
+            row2.operator("baker.atlas_restore",
+                text="Restore Original Materials",
+                icon='LOOP_BACK',
+            )
 
 
 class BAKER_PT_Cage(Panel):
@@ -3503,6 +3566,7 @@ classes = (
     BAKER_OT_AtlasRemove,
     BAKER_OT_AtlasClear,
     BAKER_OT_AtlasMerge,
+    BAKER_OT_AtlasRestore,
     BAKER_PT_Main,
     BAKER_PT_Settings,
     BAKER_PT_Output,

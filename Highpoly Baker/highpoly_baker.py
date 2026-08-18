@@ -1538,7 +1538,7 @@ def _smooth_normals_across_seams(obj):
     # Apply custom split normals
     mesh.normals_split_custom_set(loop_normals)
 
-    return {'mesh': mesh, 'had_custom': had_custom}
+    return {'mesh': mesh, 'had_custom': had_custom, 'obj': obj}
 
 
 def _restore_normals(restore_data):
@@ -1546,12 +1546,25 @@ def _restore_normals(restore_data):
     if restore_data is None:
         return
     mesh = restore_data['mesh']
-    if not restore_data['had_custom']:
-        # Clear custom normals if they weren't there before
-        if hasattr(mesh, 'free_normals_split'):
-            mesh.free_normals_split()
-        # Clear custom normals by toggling auto smooth
-        bpy.ops.object.mode_set(mode='OBJECT')
+    obj  = restore_data.get('obj')
+    if not restore_data['had_custom'] and mesh.has_custom_normals:
+        # Clear custom normals using the mesh operator (Blender 4+/5+)
+        if obj:
+            prev_active   = bpy.context.view_layer.objects.active
+            prev_selected = obj.select_get()
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            bpy.ops.object.mode_set(mode='EDIT')
+            try:
+                bpy.ops.mesh.customdata_custom_splitnormals_clear()
+            except Exception:
+                pass
+            bpy.ops.object.mode_set(mode='OBJECT')
+            obj.select_set(prev_selected)
+            try:
+                bpy.context.view_layer.objects.active = prev_active
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

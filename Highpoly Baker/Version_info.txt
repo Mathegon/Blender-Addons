@@ -1,3 +1,24 @@
+----------------V2------------------
+Three major improvements over v1:
+
+1. UV-aware seam detection instead of gradient-based
+
+The old method detected seams by looking for high gradient magnitude in the normal map pixels. This had two problems: it could false-detect sharp detail edges (like cushion stitching) as seams, and it could miss subtle seams where the normal shift is small.
+
+The new method uses _build_uv_seam_mask() — it reads the actual mesh UV layout via bmesh, finds every edge where the UV coordinates differ between adjacent faces, and rasterizes those edges onto a pixel mask using Bresenham line drawing. This is 100% precise — it knows exactly where the seams are, with zero false positives.
+
+2. Distance-based falloff instead of binary dilate
+
+The old method dilated the mask uniformly and then box-blurred it. The new method builds a distance field — pixels right on the seam get weight 1.0, pixels 1px away get 0.8, 2px away get 0.6, etc. This creates a natural gradient from "fully smoothed at seam center" to "fully original at 5px away", which is smoother than the binary dilate+blur approach.
+
+3. Normal-space interpolation instead of RGB-space
+
+The old method blurred in RGB space (encoded values 0..1) then re-normalized. The new method decodes to XYZ normal space (-1..1) first, blurs, blends with falloff, then re-normalizes and re-encodes. This is mathematically correct — averaging two unit vectors in XYZ and renormalizing gives the proper interpolated direction, while averaging their RGB encodings gives a slightly wrong direction.
+
+Combined with the existing _smooth_normals_across_seams pre-bake fix and EXTEND margin, this should get significantly closer to the 3ds Max quality.
+
+
+-------------V1---------------
 New Fix Seam Artifacts toggle in the Normal Map sub-box (on by default). 
 Here's how it works:
 

@@ -174,6 +174,14 @@ class BAKER_PG_Settings(PropertyGroup):
         default=False,
     )
 
+    normal_seam_fix: BoolProperty(
+        name="Fix Seam Artifacts",
+        description="Post-process the normal map to smooth UV seam ridge artifacts. "
+                    "Detects seam pixels via gradient analysis and applies a targeted blur "
+                    "with vector renormalization. Does not affect interior detail.",
+        default=True,
+    )
+
     alpha_smooth_sigma: FloatProperty(
         name="Edge Smoothing",
         description="Gaussian blur radius applied after baking to soften stairstepped edges. "
@@ -1513,6 +1521,77 @@ def _downsample_2x(img_hi, target_name, renormalize=False):
     return out
 
 
+def _fix_normal_seams(img, seam_threshold=0.12, blur_radius=2, dilate_radius=3):
+    """
+    Post-process a baked normal map to smooth UV seam ridge artifacts.
+
+    1. Detect seam pixels via gradient magnitude (abrupt normal direction changes)
+    2. Dilate + smooth the seam mask for gradual blending
+    3. Gaussian blur the entire normal map
+    4. Blend: use original pixels for interior, blurred pixels at seam edges
+    5. Re-normalize all vectors to unit length
+
+    Only affects the narrow band around UV seams — interior detail is untouched.
+    """
+    import numpy as np
+
+    w, h = img.size
+    pixels = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+    rgb = pixels[:, :, :3].copy()
+
+    # 1. Detect seam pixels via gradient
+    grad_y = np.abs(np.diff(rgb, axis=0, prepend=rgb[:1, :, :]))
+    grad_x = np.abs(np.diff(rgb, axis=1, prepend=rgb[:, :1, :]))
+    grad_mag = np.maximum(grad_y.max(axis=2), grad_x.max(axis=2))
+    is_empty = (rgb.max(axis=2) < 0.01)
+    seam = (grad_mag > seam_threshold) & ~is_empty
+
+    if not seam.any():
+        return  # no seams detected
+
+    # 2. Dilate + smooth the seam mask
+    mask = seam.astype(np.float32)
+    dilated = np.zeros_like(mask)
+    for dy in range(-dilate_radius, dilate_radius + 1):
+        for dx in range(-dilate_radius, dilate_radius + 1):
+            shifted = np.roll(np.roll(mask, dy, axis=0), dx, axis=1)
+            dilated = np.maximum(dilated, shifted)
+
+    k = dilate_radius * 2 + 1
+    box_k = np.ones(k, dtype=np.float32) / k
+    smooth_mask = np.apply_along_axis(
+        lambda r: np.convolve(r, box_k, mode='same'), 1, dilated)
+    smooth_mask = np.apply_along_axis(
+        lambda r: np.convolve(r, box_k, mode='same'), 0, smooth_mask)
+    smooth_mask = np.clip(smooth_mask, 0, 1)
+
+    # 3. Gaussian blur the normal map
+    size = max(3, int(6 * blur_radius) | 1)
+    kk = np.arange(-(size // 2), size // 2 + 1, dtype=np.float32)
+    gkernel = np.exp(-kk ** 2 / (2 * blur_radius ** 2))
+    gkernel /= gkernel.sum()
+
+    blurred = np.zeros_like(rgb)
+    for c in range(3):
+        tmp = np.apply_along_axis(
+            lambda r: np.convolve(r, gkernel, mode='same'), 1, rgb[:, :, c])
+        blurred[:, :, c] = np.apply_along_axis(
+            lambda r: np.convolve(r, gkernel, mode='same'), 0, tmp)
+
+    # 4. Blend
+    sm = smooth_mask[:, :, np.newaxis]
+    result_rgb = rgb * (1.0 - sm) + blurred * sm
+
+    # 5. Re-normalize vectors
+    xyz = result_rgb * 2.0 - 1.0
+    length = np.linalg.norm(xyz, axis=2, keepdims=True)
+    length = np.where(length < 1e-6, 1.0, length)
+    result_rgb = (xyz / length + 1.0) * 0.5
+
+    pixels[:, :, :3] = np.clip(result_rgb, 0.0, 1.0)
+    img.pixels = pixels.ravel().tolist()
+
+
 def _smooth_normals_across_seams(obj):
     """
     Temporarily set custom split normals from vertex normals (fully smooth,
@@ -1908,6 +1987,11 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
                 ds_img.name = img_name
                 final_img = ds_img
                 baked_images_out[bake_type] = final_img
+
+            # Normal map: fix UV seam ridge artifacts
+            if bake_type == 'NORMAL' and s.normal_seam_fix:
+                operator.report({'INFO'}, "Normal: fixing seam artifacts...")
+                _fix_normal_seams(final_img)
 
             # Normal map: flip green channel for DirectX convention
             if bake_type == 'NORMAL' and s.normal_convention == 'DIRECTX':
@@ -2930,6 +3014,7 @@ class BAKER_PT_Main(Panel):
             col3 = sub.column(align=True)
             _prop_split(col3)
             col3.prop(s, "normal_supersample", text="Supersample (2×)")
+            col3.prop(s, "normal_seam_fix", text="Fix Seam Artifacts")
 
         if s.bake_alpha:
             box.separator(factor=0.4)

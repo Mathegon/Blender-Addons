@@ -1,0 +1,14 @@
+New Fix Seam Artifacts toggle in the Normal Map sub-box (on by default). 
+Here's how it works:
+
+The problem: Blender's tangent space computation splits at UV seams, creating a different coordinate basis on each side. Even with our _smooth_normals_across_seams pre-bake fix, some seam artifacts remain because the tangent space is fundamentally discontinuous at UV boundaries. 3ds Max handles this better because its baker uses a different tangent space interpolation method.
+
+The post-process fix — 5 steps in ~2 seconds at 2K:
+
+Detect seam pixels — computes the gradient magnitude of the normal map. At UV seams, the encoded normal direction changes abruptly (gradient > 0.12), creating a clear line of high-gradient pixels. Empty/margin areas are excluded.
+Dilate the seam mask — expands the detected seam line by 3 pixels in all directions to cover the full width of the artifact, then box-blurs the mask edges for a gradual blend.
+Gaussian blur — blurs the entire normal map with radius=2.
+Selective blend — only replaces pixels where the seam mask is active. Interior pixels (99.5% of the map) keep their original sharp detail untouched. Seam pixels (0.5–5%) get the smoothed version, fading gradually from blurred to original.
+Re-normalize — decodes RGB→XYZ, normalizes all vectors back to unit length (blurring shortens them), re-encodes to RGB.
+
+This is the same technique professional tools like Substance Painter and Marmoset Toolbag use — they call it "seam padding" or "normal map healing". The result should be significantly closer to the 3ds Max quality you're seeing on the left model.

@@ -466,15 +466,31 @@ def _save_image(img, output_dir, filename, fmt='PNG', depth='8'):
     if hasattr(img, 'use_half_precision'):
         img.use_half_precision = (depth == '16' and fmt == 'OPEN_EXR')
 
-    # Set color depth on the image file output settings
     scene = bpy.context.scene
+
+    # save_render() applies the scene's view transform (AgX/Filmic) to
+    # the output. For Non-Color data textures (normals, roughness, metalness,
+    # AO, alpha) this CORRUPTS the pixel values. Fix: temporarily switch
+    # to Raw view transform so data goes through unchanged.
+    is_data = (img.colorspace_settings.name == 'Non-Color')
+    orig_view_transform = scene.view_settings.view_transform
+    orig_look           = scene.view_settings.look
+    if is_data:
+        scene.view_settings.view_transform = 'Raw'
+        scene.view_settings.look           = 'None'
+
     orig_format = scene.render.image_settings.file_format
     orig_depth  = scene.render.image_settings.color_depth
     scene.render.image_settings.file_format  = fmt
     scene.render.image_settings.color_depth  = depth
-    img.save_render(path, scene=scene)
-    scene.render.image_settings.file_format  = orig_format
-    scene.render.image_settings.color_depth  = orig_depth
+
+    try:
+        img.save_render(path, scene=scene)
+    finally:
+        scene.render.image_settings.file_format  = orig_format
+        scene.render.image_settings.color_depth  = orig_depth
+        scene.view_settings.view_transform = orig_view_transform
+        scene.view_settings.look           = orig_look
 
     return path
 
@@ -1567,14 +1583,33 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
                 context.scene.cycles.device = 'GPU'
                 operator.report({'INFO'}, "Switched Cycles to GPU compute.")
 
-    # Temporarily unhide source objects — hidden objects can't be selected
-    # for baking, which silently produces a black result.
+    # Temporarily unhide source objects AND their collections —
+    # hidden collections override object visibility even after hide_set(False).
     hidden_objects = []
-    for obj in highs + [low]:
+    hidden_collections = []
+
+    def _ensure_visible(obj):
+        """Unhide an object and any hidden parent collections. Track what was changed."""
         if obj.hide_get():
             hidden_objects.append(obj)
             obj.hide_set(False)
-    if hidden_objects:
+        # Check if still invisible (collection is hidden)
+        if not obj.visible_get():
+            def _check_lc(lc):
+                if obj.name in lc.collection.objects:
+                    if lc.hide_viewport:
+                        lc.hide_viewport = False
+                        hidden_collections.append(lc)
+                    if lc.exclude:
+                        lc.exclude = False
+                        hidden_collections.append(lc)
+                for child in lc.children:
+                    _check_lc(child)
+            _check_lc(context.view_layer.layer_collection)
+
+    for obj in highs + [low]:
+        _ensure_visible(obj)
+    if hidden_objects or hidden_collections:
         names = ", ".join(o.name for o in hidden_objects)
         operator.report({'WARNING'}, f"Auto-unhid for bake: {names}")
 
@@ -1884,9 +1919,11 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
         bpy.app.handlers.object_bake_pre.remove(_pre_handler)
         wm.progress_end()
 
-        # Restore hidden state for objects we unhid
+        # Restore hidden state for objects and collections we unhid
         for obj in hidden_objects:
             obj.hide_set(True)
+        for lc in hidden_collections:
+            lc.hide_viewport = True
 
     # ORM packed texture export
     if s.export_orm:
@@ -2082,13 +2119,29 @@ class BAKER_OT_BakeQueue(Operator):
             highs = [item.high_poly]
             low   = item.low_poly
 
-            # Unhide objects FIRST — hidden objects can't be selected,
-            # which breaks scale check, bake, and everything else.
+            # Unhide objects AND collections FIRST
             queue_hidden = []
-            for obj in highs + [low]:
+            queue_hidden_cols = []
+
+            def _ensure_visible_queue(obj):
                 if obj.hide_get():
                     queue_hidden.append(obj)
                     obj.hide_set(False)
+                if not obj.visible_get():
+                    def _check_lc(lc):
+                        if obj.name in lc.collection.objects:
+                            if lc.hide_viewport:
+                                lc.hide_viewport = False
+                                queue_hidden_cols.append(lc)
+                            if lc.exclude:
+                                lc.exclude = False
+                                queue_hidden_cols.append(lc)
+                        for child in lc.children:
+                            _check_lc(child)
+                    _check_lc(context.view_layer.layer_collection)
+
+            for obj in highs + [low]:
+                _ensure_visible_queue(obj)
             if queue_hidden:
                 names = ", ".join(o.name for o in queue_hidden)
                 self.report({'WARNING'}, f"Queue item {idx+1}: auto-unhid: {names}")
@@ -2098,6 +2151,8 @@ class BAKER_OT_BakeQueue(Operator):
                 # Re-hide before continuing
                 for obj in queue_hidden:
                     obj.hide_set(True)
+                for lc in queue_hidden_cols:
+                    lc.hide_viewport = True
                 continue
 
             # Scale check
@@ -2111,6 +2166,8 @@ class BAKER_OT_BakeQueue(Operator):
             if not scale_ok:
                 for obj in queue_hidden:
                     obj.hide_set(True)
+                for lc in queue_hidden_cols:
+                    lc.hide_viewport = True
                 continue
 
             # UV overlap check
@@ -2163,6 +2220,8 @@ class BAKER_OT_BakeQueue(Operator):
                 # Re-hide any objects we unhid for this queue item
                 for obj in queue_hidden:
                     obj.hide_set(True)
+                for lc in queue_hidden_cols:
+                    lc.hide_viewport = True
 
         context.scene.render.engine = orig_engine
         bpy.ops.object.select_all(action='DESELECT')
@@ -2213,6 +2272,33 @@ class BAKER_OT_Bake(Operator):
         if not (s.bake_normals or s.bake_ao or s.bake_diffuse or s.bake_roughness or s.bake_metalness or s.bake_alpha):
             self.report({'ERROR'}, "Enable at least one bake pass.")
             return {'CANCELLED'}
+
+        # Unhide objects AND their collections before any validation
+        bake_hidden = []
+        bake_hidden_collections = []
+
+        def _ensure_visible_bake(obj):
+            if obj.hide_get():
+                bake_hidden.append(obj)
+                obj.hide_set(False)
+            if not obj.visible_get():
+                def _check_lc(lc):
+                    if obj.name in lc.collection.objects:
+                        if lc.hide_viewport:
+                            lc.hide_viewport = False
+                            bake_hidden_collections.append(lc)
+                        if lc.exclude:
+                            lc.exclude = False
+                            bake_hidden_collections.append(lc)
+                    for child in lc.children:
+                        _check_lc(child)
+                _check_lc(context.view_layer.layer_collection)
+
+        for obj in highs + [low]:
+            _ensure_visible_bake(obj)
+        if bake_hidden:
+            names = ", ".join(o.name for o in bake_hidden)
+            self.report({'WARNING'}, f"Auto-unhid for bake: {names}")
 
         # Scale check
         for obj in highs + [low]:
@@ -2273,6 +2359,11 @@ class BAKER_OT_Bake(Operator):
                 except: pass
             try: context.view_layer.objects.active = prev_active
             except: pass
+            # Re-hide any objects and collections we unhid
+            for obj in bake_hidden:
+                obj.hide_set(True)
+            for lc in bake_hidden_collections:
+                lc.hide_viewport = True
 
         if s.post_bake_preview:
             _set_material_preview(context)

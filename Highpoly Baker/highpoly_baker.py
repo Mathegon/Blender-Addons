@@ -3234,27 +3234,94 @@ class BAKER_OT_AtlasMerge(Operator):
         atlas_res = int(s.atlas_resolution)
 
         # ── 1. Detect which map types exist across all objects ────────────
-        MAP_LABELS = {
-            'Diffuse':   'DIFFUSE',
-            'AO':        'AO',
-            'Roughness': 'ROUGHNESS',
-            'Metalness': 'METALNESS',
-            'Normal Map':'NORMAL',
-            'Alpha':     'ALPHA',
+        # Detect by tracing what each Image Texture node is connected to
+        # on the Principled BSDF (or via a Normal Map node, Mix node, etc.)
+        # This works regardless of node labels — even for "Baked: ..." nodes
+        # from node bake operations.
+        SOCKET_TO_MAP = {
+            'Base Color': 'DIFFUSE',
+            'Roughness':  'ROUGHNESS',
+            'Metallic':   'METALNESS',
+            'Normal':     'NORMAL',
+            'Alpha':      'ALPHA',
         }
+        # Label-based fallback for nodes not directly connected to BSDF
+        LABEL_FALLBACK = {
+            'diffuse': 'DIFFUSE', 'color': 'DIFFUSE', 'base color': 'DIFFUSE',
+            'ao': 'AO', 'ambient': 'AO', 'occlusion': 'AO',
+            'roughness': 'ROUGHNESS', 'rough': 'ROUGHNESS',
+            'metalness': 'METALNESS', 'metallic': 'METALNESS', 'metal': 'METALNESS',
+            'normal': 'NORMAL',
+            'alpha': 'ALPHA',
+        }
+
+        def _detect_maps_for_material(mat):
+            """Return dict of {map_type: tex_image_node} by tracing connections."""
+            if not mat or not mat.use_nodes:
+                return {}
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            result = {}
+
+            # Find BSDF
+            bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+
+            # Trace each BSDF input back to find Image Texture nodes
+            if bsdf:
+                for socket_name, map_type in SOCKET_TO_MAP.items():
+                    sock = bsdf.inputs.get(socket_name)
+                    if not sock:
+                        continue
+                    # Walk backwards through links to find an Image Texture
+                    tex_node = _trace_to_image(sock, links, max_depth=5)
+                    if tex_node and map_type not in result:
+                        result[map_type] = tex_node
+
+            # AO is often connected via a Mix/Multiply node to Base Color,
+            # not directly to BSDF. Check for any tex labeled AO.
+            if 'AO' not in result:
+                for node in nodes:
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        label = (node.label or node.name).lower()
+                        if 'ao' in label or 'occlusion' in label:
+                            result['AO'] = node
+
+            # Label fallback for anything still not detected
+            for node in nodes:
+                if node.type == 'TEX_IMAGE' and node.image:
+                    label = (node.label or node.name).lower()
+                    for key, map_type in LABEL_FALLBACK.items():
+                        if key in label and map_type not in result:
+                            result[map_type] = node
+
+            return result
+
+        def _trace_to_image(socket, links, max_depth=5):
+            """Walk backwards from a socket through links to find an Image Texture node."""
+            if max_depth <= 0:
+                return None
+            for lnk in links:
+                if lnk.to_socket == socket:
+                    from_node = lnk.from_node
+                    if from_node.type == 'TEX_IMAGE' and from_node.image:
+                        return from_node
+                    # Follow through intermediate nodes (Normal Map, Mix, etc.)
+                    for inp in from_node.inputs:
+                        found = _trace_to_image(inp, links, max_depth - 1)
+                        if found:
+                            return found
+            return None
+
         found_maps = set()
+        per_mat_maps = {}  # {material_name: {map_type: node}}
         for obj in objects:
             if not obj.data.materials:
                 continue
             mat = obj.data.materials[0]
-            if not mat or not mat.use_nodes:
-                continue
-            for node in mat.node_tree.nodes:
-                if node.type == 'TEX_IMAGE' and node.image:
-                    label = node.label or node.name
-                    for key, map_type in MAP_LABELS.items():
-                        if key.lower() in label.lower():
-                            found_maps.add(map_type)
+            detected = _detect_maps_for_material(mat)
+            if detected:
+                per_mat_maps[mat.name] = detected
+                found_maps.update(detected.keys())
 
         if not found_maps:
             self.report({'ERROR'}, "No baked textures found on the selected objects.")
@@ -3362,16 +3429,11 @@ class BAKER_OT_AtlasMerge(Operator):
                     links = mat.node_tree.links
 
                     # Find the texture node for this map type
+                    # Use the same connection-tracing logic as detection
                     source_node = None
-                    for node in nodes:
-                        if node.type == 'TEX_IMAGE' and node.image:
-                            label = (node.label or node.name).lower()
-                            for key, mt in MAP_LABELS.items():
-                                if mt == map_type and key.lower() in label:
-                                    source_node = node
-                                    break
-                        if source_node:
-                            break
+                    mat_detected = _detect_maps_for_material(mat)
+                    if map_type in mat_detected:
+                        source_node = mat_detected[map_type]
 
                     if source_node is None:
                         continue

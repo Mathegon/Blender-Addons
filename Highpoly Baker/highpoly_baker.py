@@ -182,6 +182,18 @@ class BAKER_PG_Settings(PropertyGroup):
         default=True,
     )
 
+    normal_edge_smooth: FloatProperty(
+        name="Edge Smoothing",
+        description="Gaussian blur sigma applied to the entire normal map after baking. "
+                    "Smooths jagged polygon-edge transitions in the normal map. "
+                    "0 = off, 0.5 = subtle, 1.0 = moderate, 2.0 = heavy",
+        default=0.0,
+        min=0.0,
+        max=4.0,
+        step=10,
+        precision=2,
+    )
+
     alpha_smooth_sigma: FloatProperty(
         name="Edge Smoothing",
         description="Gaussian blur radius applied after baking to soften stairstepped edges. "
@@ -1521,6 +1533,51 @@ def _downsample_2x(img_hi, target_name, renormalize=False):
     return out
 
 
+def _smooth_normal_edges(img, sigma):
+    """
+    Apply a light Gaussian blur to the normal map to smooth jagged
+    polygon-edge transitions. Works in decoded normal space (XYZ)
+    and re-normalizes after blurring.
+    """
+    import numpy as np
+
+    if sigma <= 0:
+        return
+
+    w, h = img.size
+    pixels = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+    rgb = pixels[:, :, :3]
+
+    # Decode to normal space
+    xyz = rgb * 2.0 - 1.0
+
+    # Build Gaussian kernel
+    size = max(3, int(6 * sigma) | 1)
+    kk = np.arange(-(size // 2), size // 2 + 1, dtype=np.float32)
+    gkernel = np.exp(-kk ** 2 / (2 * sigma ** 2))
+    gkernel /= gkernel.sum()
+
+    # Separable convolution
+    blurred = np.zeros_like(xyz)
+    for c in range(3):
+        tmp = np.apply_along_axis(
+            lambda r: np.convolve(r, gkernel, mode='same'), 1, xyz[:, :, c])
+        blurred[:, :, c] = np.apply_along_axis(
+            lambda r: np.convolve(r, gkernel, mode='same'), 0, tmp)
+
+    # Re-normalize
+    length = np.linalg.norm(blurred, axis=2, keepdims=True)
+    length = np.where(length < 1e-6, 1.0, length)
+    result_rgb = (blurred / length + 1.0) * 0.5
+
+    # Preserve empty/margin areas
+    is_empty = (rgb.max(axis=2) < 0.01)
+    result_rgb[is_empty] = rgb[is_empty]
+
+    pixels[:, :, :3] = np.clip(result_rgb, 0.0, 1.0)
+    img.pixels = pixels.ravel().tolist()
+
+
 def _build_uv_seam_mask(obj, resolution):
     """
     Build a pixel mask of UV seam edges from the actual mesh UV layout.
@@ -2050,6 +2107,12 @@ def _do_bake(operator, context, highs, low, s, prefix, baked_images_out):
                 operator.report({'INFO'}, "Normal: fixing seam artifacts (UV-aware)...")
                 _fix_normal_seams(final_img, obj=low)
 
+            # Normal map: smooth jagged polygon-edge transitions
+            if bake_type == 'NORMAL' and s.normal_edge_smooth > 0:
+                operator.report({'INFO'},
+                    f"Normal: edge smoothing (sigma={s.normal_edge_smooth:.2f})...")
+                _smooth_normal_edges(final_img, s.normal_edge_smooth)
+
             # Normal map: flip green channel for DirectX convention
             if bake_type == 'NORMAL' and s.normal_convention == 'DIRECTX':
                 operator.report({'INFO'}, "Normal: flipping green channel for DirectX...")
@@ -2395,6 +2458,19 @@ class BAKER_OT_BakeQueue(Operator):
 # ---------------------------------------------------------------------------
 # Main bake operator
 # ---------------------------------------------------------------------------
+
+class BAKER_OT_ClearObjects(Operator):
+    bl_idname  = "baker.clear_objects"
+    bl_label   = "Clear Objects"
+    bl_description = "Clear both High-Poly and Low-Poly fields"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.baker_settings
+        s.high_poly = None
+        s.low_poly  = None
+        return {'FINISHED'}
+
 
 class BAKER_OT_Bake(Operator):
     bl_idname  = "baker.bake"
@@ -3017,6 +3093,12 @@ class BAKER_PT_Main(Panel):
         row.alert = s.low_poly is None
         row.prop(s, "low_poly", icon='MESH_GRID')
 
+        col.separator(factor=0.3)
+        clr = col.row(align=True)
+        clr.alignment = 'RIGHT'
+        clr.enabled = s.high_poly is not None or s.low_poly is not None
+        clr.operator("baker.clear_objects", text="Clear", icon='TRASH')
+
         # Quick-add to bake queue
         box.separator(factor=0.4)
         q_row = box.row(align=True)
@@ -3072,6 +3154,7 @@ class BAKER_PT_Main(Panel):
             _prop_split(col3)
             col3.prop(s, "normal_supersample", text="Supersample (2×)")
             col3.prop(s, "normal_seam_fix", text="Fix Seam Artifacts")
+            col3.prop(s, "normal_edge_smooth")
 
         if s.bake_alpha:
             box.separator(factor=0.4)
@@ -3910,6 +3993,7 @@ classes = (
     BAKER_OT_QueueRemove,
     BAKER_OT_QueueClear,
     BAKER_OT_BakeQueue,
+    BAKER_OT_ClearObjects,
     BAKER_OT_Bake,
     BAKER_OT_BakeSelectedNode,
     BAKER_OT_AutoCageOffset,

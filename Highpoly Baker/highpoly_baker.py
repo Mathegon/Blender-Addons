@@ -561,6 +561,13 @@ def _pack_orm(ao_img, rough_img, metal_img, output_dir, filename, fmt='PNG', dep
     orm_img.pixels = orm.ravel().tolist()
 
     path = _save_image(orm_img, output_dir, filename, fmt=fmt, depth=depth)
+
+    # save_render changes source to FILE and can wipe the pixel buffer.
+    # Reload the image from the saved file to restore the pixel data.
+    orm_img.source = 'FILE'
+    orm_img.filepath = path
+    orm_img.reload()
+
     return path
 
 
@@ -734,8 +741,8 @@ def _build_baked_material(low_obj, baked_images, preserve_materials, uv_layer_na
         sep.label    = 'Unpack ORM'
         links.new(orm_tex.outputs['Color'], sep.inputs['Color'])
 
-        # R=AO → multiply with Base Color (same pattern as individual AO)
-        if diff_tex or 'DIFFUSE' in baked_images:
+        # R=AO → multiply with Base Color (only if AO was actually baked)
+        if 'AO' in baked_images and (diff_tex or 'DIFFUSE' in baked_images):
             # Find the existing Base Color link to insert AO multiply
             ao_mix = nodes.new('ShaderNodeMixRGB')
             ao_mix.location   = (MID_X + 150, row_y + 60)

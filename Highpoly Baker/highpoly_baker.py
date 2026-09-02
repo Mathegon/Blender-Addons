@@ -3737,6 +3737,24 @@ class BAKER_OT_AtlasMerge(Operator):
 
         context.scene.render.engine = orig_engine
 
+        # ── 4b. ORM packing (if enabled) ─────────────────────────────────
+        if s.export_orm:
+            ao_img    = atlas_images.get('AO')
+            rough_img = atlas_images.get('ROUGHNESS')
+            metal_img = atlas_images.get('METALNESS')
+            if ao_img or rough_img or metal_img:
+                orm_name = prefix + "Atlas_ORM"
+                orm_path = _pack_orm(
+                    ao_img, rough_img, metal_img,
+                    s.output_dir, orm_name,
+                    fmt=s.output_format, depth=s.output_depth,
+                )
+                if orm_path:
+                    orm_img = bpy.data.images.get(orm_name)
+                    if orm_img:
+                        atlas_images['ORM'] = orm_img
+                    self.report({'INFO'}, f"Atlas ORM packed: {orm_path}")
+
         # ── 5. Build shared atlas material ───────────────────────────────
         atlas_mat = _build_baked_material(joined, atlas_images, False, uv_layer_name=atlas_uv_name)
         atlas_mat.name = "Atlas_Material"

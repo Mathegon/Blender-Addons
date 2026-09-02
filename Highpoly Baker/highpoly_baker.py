@@ -556,6 +556,11 @@ def _pack_orm(ao_img, rough_img, metal_img, output_dir, filename, fmt='PNG', dep
     orm[:, :, 2] = get_channel(metal_img)  # B = Metallic
     orm[:, :, 3] = 1.0
 
+    # Remove any existing image with this name to avoid .001 suffix conflicts
+    existing = bpy.data.images.get(filename)
+    if existing:
+        bpy.data.images.remove(existing)
+
     orm_img = bpy.data.images.new(filename, w, h, alpha=False, is_data=True)
     orm_img.colorspace_settings.name = 'Non-Color'
     orm_img.pixels = orm.ravel().tolist()

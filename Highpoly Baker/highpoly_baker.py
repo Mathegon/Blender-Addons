@@ -3470,6 +3470,32 @@ class BAKER_OT_AtlasMerge(Operator):
 
         atlas_res = int(s.atlas_resolution)
 
+        # ── 0. Auto-restore original materials ───────────────────────────
+        # If objects already have an Atlas_Material from a previous merge,
+        # we must restore their individual baked materials first. Otherwise
+        # we'd re-bake from atlas textures (wrong UV, double-encoded normals).
+        restored = 0
+        for item in s.atlas_list:
+            obj = item.obj
+            if obj is None or not item.orig_material:
+                continue
+            current_mat = obj.data.materials[0].name if obj.data.materials else ""
+            if current_mat != item.orig_material:
+                orig_mat = bpy.data.materials.get(item.orig_material)
+                if orig_mat:
+                    if obj.data.materials:
+                        obj.data.materials[0] = orig_mat
+                    else:
+                        obj.data.materials.append(orig_mat)
+                    # Restore original UV layer
+                    if item.orig_uv_layer:
+                        uv = obj.data.uv_layers.get(item.orig_uv_layer)
+                        if uv:
+                            obj.data.uv_layers.active = uv
+                    restored += 1
+        if restored:
+            self.report({'INFO'}, f"Atlas: auto-restored {restored} original material(s) before merge.")
+
         # ── 1. Detect which map types exist across all objects ────────────
         # Detect by tracing what each Image Texture node is connected to
         # on the Principled BSDF (or via a Normal Map node, Mix node, etc.)
@@ -3500,36 +3526,44 @@ class BAKER_OT_AtlasMerge(Operator):
             links = mat.node_tree.links
             result = {}
 
-            # Find BSDF
-            bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            # First pass: find individual texture nodes by label.
+            # These take priority over ORM-traced connections, because when
+            # ORM is enabled the BSDF inputs go through Separate Color → ORM
+            # which would incorrectly return the packed ORM image as metalness/roughness.
+            for node in nodes:
+                if node.type == 'TEX_IMAGE' and node.image:
+                    label = (node.label or node.name).lower()
+                    # Skip ORM/bake target nodes
+                    if 'orm' in label or 'bake_target' in label:
+                        continue
+                    for key, map_type in LABEL_FALLBACK.items():
+                        if key in label and map_type not in result:
+                            result[map_type] = node
 
-            # Trace each BSDF input back to find Image Texture nodes
+            # Second pass: trace BSDF connections for any maps not yet found
+            bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
             if bsdf:
                 for socket_name, map_type in SOCKET_TO_MAP.items():
+                    if map_type in result:
+                        continue  # already found by label
                     sock = bsdf.inputs.get(socket_name)
                     if not sock:
                         continue
-                    # Walk backwards through links to find an Image Texture
                     tex_node = _trace_to_image(sock, links, max_depth=5)
-                    if tex_node and map_type not in result:
+                    # Skip if the traced node is an ORM packed texture
+                    if tex_node:
+                        label = (tex_node.label or tex_node.name).lower()
+                        if 'orm' in label:
+                            continue
                         result[map_type] = tex_node
 
-            # AO is often connected via a Mix/Multiply node to Base Color,
-            # not directly to BSDF. Check for any tex labeled AO.
+            # AO special case
             if 'AO' not in result:
                 for node in nodes:
                     if node.type == 'TEX_IMAGE' and node.image:
                         label = (node.label or node.name).lower()
                         if 'ao' in label or 'occlusion' in label:
                             result['AO'] = node
-
-            # Label fallback for anything still not detected
-            for node in nodes:
-                if node.type == 'TEX_IMAGE' and node.image:
-                    label = (node.label or node.name).lower()
-                    for key, map_type in LABEL_FALLBACK.items():
-                        if key in label and map_type not in result:
-                            result[map_type] = node
 
             return result
 
